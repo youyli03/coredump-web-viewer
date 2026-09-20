@@ -1,0 +1,30 @@
+# Developing across Windows / Linux / WSL2 — normalize text line endings
+* text=auto
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.html  text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.ps1   text eol=crlf
+
+# Files with no extension of their own, which `* text=auto` would otherwise leave to `core.autocrlf` — true on the
+# Windows development box, so a clone there would check them out as CRLF while the repository stores LF. Naming them
+# keeps the working copy and the history the same on every machine.
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+LICENSE         text eol=lf
+*.txt           text eol=lf
+
+# Binary: never diffed / never converted
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.core  binary
+*.dmp   binary
+*.gz    binary

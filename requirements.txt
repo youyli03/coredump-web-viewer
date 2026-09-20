@@ -1,0 +1,15 @@
+# Dependencies.
+#
+# Only what the code actually uses is listed as active. Every line here is imported by something in `src/`;
+# a dependency that is not imported yet is commented out rather than installed-and-unused.
+
+# Tests
+pytest>=8.0
+
+# The API layer (`src/web/`) and the process that runs it.
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27
+
+# The memory map: PT_LOAD + the NT_FILE note (`src/analysis/elf.py`). gdb cannot answer this one — it is the
+# core's own record of its address space.
+pyelftools>=0.30

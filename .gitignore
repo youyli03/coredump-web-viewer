@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Red line: core files never enter the repository
+#   · Easily GB-sized; once committed, git can never clean them out completely
+#   · Contain sensitive memory contents such as keys / user data
+#   Correct approach: reference them by path only (see AGENTS.md 3.1)
+# ---------------------------------------------------------------------------
+*.core
+*.core.gz
+core
+core.[0-9]*
+*.dmp
+*.mdmp
+*.sym
+*.debug
+
+# Local cache / analysis artifacts
+.cache/
+tmp/
+practice/out/
+data/cores/
+data/symbols/
+*.jsonl
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / frontend ---
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+# --- Local config / editors / OS ---
+.env
+.env.local
+AGENTS.local.md
+# Local UI state: the cores this checkout has opened (paths on this machine, nothing else).
+.coredump-viewer.json
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+Thumbs.db
+desktop.ini
+
+# --- Generated, never committed ---
+# The offline fixtures the page falls back to when no backend is running: produced by
+# `scripts/dump-fixture.py` from a practice core, so they are reproducible and do not belong here.
+ui/data/
