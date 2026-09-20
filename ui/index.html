@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>coredump-web-viewer · UI demo</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="errors"></div>
+
+  <div id="app">
+    <!-- Replaced by the first render(). If this text is still here, app.js did not run. -->
+    <div class="boot-hint">
+      <h2>Starting the demo…</h2>
+      <p>If this message stays on screen, <code>app.js</code> did not execute. The usual causes:</p>
+      <ul>
+        <li>The page was opened as a <code>file://</code> path — scripts are then blocked. Use
+          <code>http://127.0.0.1:8010/</code>.</li>
+        <li>The server sent <code>app.js</code> with a non-JavaScript content type
+          (on Windows Python reports <code>.js</code> as <code>text/plain</code>, and a browser refuses to
+          run a module with that type). Serve the demo with <code>tmp/serve_demo.py</code>, not
+          <code>python -m http.server</code>.</li>
+        <li>Anything else will appear in the red bar above.</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer id="devbar">
+    <!-- The cores loaded in this session, one tab each, with an × to close it. "sample" was the old word: the bar
+         used to hold two practice samples and nothing else. -->
+    <span class="dim">cores:</span>
+    <span id="samples"></span>
+    <span class="dim">state:</span>
+    <!-- One indicator, showing where the app actually is. This used to be five buttons that forced each state
+         by hand: a development affordance, and a misleading one in a bar that also reports real progress —
+         the lit button looked like a reading of the app, and four of the five could never be true at once. -->
+    <span id="statebadge" class="badge">empty</span>
+    <!-- The right-hand side is an event log, not a sentence: loading, ready, a switch, a failure. The newest
+         line is always visible; clicking opens the history, because a summary that replaces itself loses the
+         one thing a log is for. -->
+    <span id="logline" class="dim" title="click for the whole log"></span>
+    <div id="logpanel" hidden></div>
+  </footer>
+
+  <!-- A classic script so that it runs even when the module below cannot. -->
+  <script>
+    (function () {
+      var box = document.getElementById("errors");
+      function show(label, detail) {
+        var line = document.createElement("div");
+        line.className = "error-line";
+        line.textContent = label + ": " + detail;
+        box.appendChild(line);
+      }
+      // Capture phase on purpose: a resource that failed to load fires on the element, not the window,
+      // and does not bubble — which is exactly the failure this bar exists to reveal.
+      window.addEventListener(
+        "error",
+        function (event) {
+          var target = event.target;
+          if (target && target !== window && target.tagName) {
+            show("failed to load", target.tagName.toLowerCase() + " " + (target.src || target.href || ""));
+            return;
+          }
+          show("script error", event.message + " (" + (event.filename || "?") + ":" + (event.lineno || 0) + ")");
+        },
+        true,
+      );
+      window.addEventListener("unhandledrejection", function (event) {
+        show("unhandled rejection", (event.reason && event.reason.message) || String(event.reason));
+      });
+      if (location.protocol === "file:") {
+        show("note", "this page is open as file:// — scripts will not run; serve it over http://");
+      }
+    })();
+  </script>
+  <script type="module" src="app.js?v=3"></script>
+</body>
+</html>

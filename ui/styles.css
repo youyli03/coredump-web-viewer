@@ -1,0 +1,722 @@
+/* UI demo styles. Dark, dense, monospace where addresses live — debugger conventions. */
+
+:root {
+  --bg: #11141a;
+  --panel: #171b23;
+  --panel-2: #1d222c;
+  --line: #2a3040;
+  --fg: #d8dde6;
+  --dim: #8a93a3;
+  --accent: #62a8ff;
+  --crash: #ff6b6b;
+  --exec: #ffc46b;
+  --read: #7fd18b;
+  --anon: #6d7a90;
+  --stack: #c58bff;
+  --data: #62a8ff;
+  --heap: #ff8fa3;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  height: 100vh;
+  display: grid;
+  grid-template-rows: 1fr auto;
+}
+
+/* A column: the topbar is what it is, and everything under it shares what is left. The body's grid already gives
+   `#app` the row above the devbar, so the height is decided once, by the shell. */
+#app { overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+.topbar { flex: 0 0 auto; }
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.topbar .name { font-weight: 600; }
+.topbar .meta { color: var(--dim); font-family: var(--mono); font-size: 11.5px; }
+.topbar .spacer { flex: 1; }
+button {
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 9px; font: inherit; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #071018; border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* capability badges: the only switch the UI reads */
+.caps { display: flex; gap: 5px; flex-wrap: wrap; }
+.cap {
+  font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 4px;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.cap.on { color: var(--read); border-color: #2f5c39; }
+.cap.off { text-decoration: line-through; opacity: .8; }
+.cap.na { color: var(--anon); }
+
+/* ---------- layout ---------- */
+/* The middle of the page grows to fill whatever the chrome leaves, instead of subtracting a number from the
+   viewport. `calc(100vh - 90px)` was that number: the topbar is 45 and the devbar is 34, so an 11-pixel strip of
+   background sat between the content and the footer — and the number went stale the moment the devbar changed
+   height (which it did, when five state buttons became one badge). */
+.layout { display: grid; grid-template-columns: 300px 1fr; flex: 1 1 auto; min-height: 0; }
+.aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; }
+.main { display: grid; grid-template-rows: auto 1fr; overflow: hidden; }
+/* A state screen is the only child of `.main`, so without this it lands in the `auto` row and the card centres
+   inside a content-height box at the top of the column instead of in the column. Spanning every row is what makes
+   "centred" mean the whole main area. */
+.main > .screen { grid-row: 1 / -1; }
+
+.section-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim);
+  padding: 9px 12px 5px;
+}
+
+/* ---------- thread list ---------- */
+.thread {
+  display: grid; grid-template-columns: 14px 26px 1fr auto; gap: 6px; align-items: baseline;
+  padding: 5px 12px; cursor: pointer; border-left: 2px solid transparent;
+}
+.thread:hover { background: var(--panel-2); }
+.thread.selected { background: var(--panel-2); border-left-color: var(--accent); }
+.thread .dot { color: var(--crash); }
+.thread .num { color: var(--dim); font-family: var(--mono); font-size: 11.5px; }
+.thread .tid { color: var(--anon); font-family: var(--mono); font-size: 10.5px; }
+.thread .where { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread .where .pc { color: var(--dim); }
+.thread.crashed .where { color: var(--fg); }
+
+/* ---------- tabs ---------- */
+.tabs { display: flex; gap: 4px; padding: 8px 14px 0; border-bottom: 1px solid var(--line); }
+.tab {
+  background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0;
+  padding: 4px 12px; color: var(--dim);
+}
+.tab.active { color: var(--fg); background: var(--panel); border-color: var(--line); }
+.tab:disabled { opacity: .4; }
+
+.view { overflow: auto; padding: 10px 14px 40px; }
+.viewhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0 10px; }
+.viewhead .addr { font-family: var(--mono); }
+.viewhead .spacer { flex: 1; }
+.dim { color: var(--dim); }
+.code { font-family: var(--mono); color: var(--exec); }
+
+/* ---------- stack: an IDA-style flow graph down the call chain ---------- */
+.flow { display: flex; flex-direction: column; align-items: center; padding: 4px 0 30px; }
+.arrow { color: var(--dim); font-size: 13px; line-height: 1; padding: 3px 0; }
+.fnode {
+  display: grid; grid-template-columns: 74px 1fr auto; align-items: start; gap: 10px;
+  width: min(760px, 100%); padding: 6px 10px; font-family: var(--mono);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+.fnode .lvl { color: var(--dim); font-size: 11.5px; }
+.fnode .fhead { display: flex; gap: 10px; align-items: baseline; }
+.fnode .fn { font-weight: 600; }
+.fnode .site { color: var(--dim); font-size: 11.5px; }
+.fargs { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-top: 2px; font-size: 11.5px; }
+.fargs.dim { color: var(--anon); font-style: italic; }
+.flocals { display: flex; flex-wrap: wrap; gap: 2px 16px; align-items: baseline; margin-top: 4px; padding: 3px 8px; border-left: 2px solid var(--line); font-size: 11.5px; }
+.flocals.dim { color: var(--anon); font-style: italic; }
+.flocals .flabel { color: var(--anon); text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
+.arg { display: inline-flex; gap: 5px; align-items: baseline; }
+.arg .aname { color: var(--fg); }
+.arg.is-local .aname { color: var(--dim); }
+.arg .aeq { color: var(--line); }
+.fnode .fright { display: flex; align-items: center; gap: 6px; }
+.fnode .pc, button.pc {
+  background: none; border: none; padding: 0; color: var(--accent);
+  font-family: var(--mono); font-size: 11.5px; cursor: pointer;
+}
+.fnode .pc:hover { text-decoration: underline; }
+.fnode.crash { border-color: var(--crash); background: rgba(255, 107, 107, .10); }
+.fnode.crash .fn { color: var(--crash); }
+.fnode.nosym .fn, .fnode.nosym .site { color: var(--anon); font-style: italic; }
+.fnode .tag {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--crash); border: 1px solid var(--crash); border-radius: 3px; padding: 0 5px;
+}
+.fnode .count { color: var(--accent); }
+.fnode.repeat { border-style: dashed; }
+.fgroup { width: min(760px, 100%); }
+.fgroup .fnode { width: 100%; }
+.funfolded { display: flex; flex-direction: column; gap: 3px; margin: 4px 0 4px 26px; }
+.funfolded .fnode { padding: 3px 8px; background: var(--panel-2); }
+button.twisty { font-size: 11px; padding: 1px 7px; color: var(--dim); }
+button.twisty.active { color: var(--fg); border-color: var(--accent); }
+.frames-note { color: var(--dim); font-size: 11.5px; font-family: var(--mono); }
+.locals { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 0 10px; font-size: 11.5px; }
+.chip {
+  font-family: var(--mono); font-size: 11.5px; padding: 1px 8px; border-radius: 10px;
+  background: var(--panel-2); border: 1px solid var(--line);
+}
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+
+
+/* ---------- registers ---------- */
+table.regs { border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+table.regs td { padding: 2px 14px 2px 0; }
+table.regs td.name { color: var(--dim); }
+table.regs td.value { color: var(--fg); cursor: pointer; }
+table.regs td.value:hover { color: var(--accent); text-decoration: underline; }
+table.regs tr.hot td.name, table.regs tr.hot td.value { color: var(--crash); }
+.regcols { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0 24px; }
+
+/* ---------- memory ---------- */
+.strip { position: relative; height: 46px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; margin: 4px 0 6px; }
+.strip .bar { position: absolute; top: 8px; height: 30px; border-radius: 2px; cursor: pointer; opacity: .85; }
+.strip .bar:hover, .strip .bar.selected { opacity: 1; outline: 1px solid var(--fg); }
+/* Where the address on screen sits in the whole address space: without it the strip is a picture, with it
+   it is a map you can find yourself on. */
+.strip .here { position: absolute; top: 2px; bottom: 2px; width: 2px; margin-left: -1px; background: #fff; box-shadow: 0 0 5px rgba(255, 255, 255, .9); pointer-events: none; }
+.strip-legend { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 12px; }
+.legend-chip { display: inline-flex; align-items: center; gap: 5px; background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; font: inherit; font-size: 11px; cursor: pointer; }
+.legend-chip:hover { color: var(--fg); }
+.legend-chip .swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--dim); font-size: 11.5px; margin-bottom: 10px; }
+.legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+table.regions { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+table.regions th { text-align: left; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--line); padding: 4px 10px 4px 0; }
+table.regions td { padding: 3px 10px 3px 0; border-bottom: 1px solid rgba(42, 48, 64, .5); }
+table.regions tr { cursor: pointer; }
+table.regions tr:hover td { background: var(--panel-2); }
+table.regions tr.selected td { background: rgba(98, 168, 255, .12); }
+table.regions td.size { text-align: right; }
+table.regions td.perm { color: var(--dim); }
+table.regions .anon { color: var(--anon); font-style: italic; }
+
+/* ---------- memory: hex editor on the left, meaning on the right ---------- */
+.view.memview { display: grid; grid-template-rows: auto auto auto 1fr; overflow: hidden; padding: 10px 14px 0; }
+.hexsplit { display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; border: 1px solid var(--line); border-radius: 6px 6px 0 0; }
+/* The pane is a column: its header and legend never scroll, and only `.hexscroll` does. That is what keeps
+   a sticky ruler from sliding over the header, and it keeps the chrome visible while reading a 132 KB
+   region. The minimap sits beside the scroller, so it shows the whole window while the rows show a screen. */
+.hexpane { display: flex; flex-direction: column; overflow: hidden; background: #0d1016; padding: 6px 0 0; min-height: 0; }
+
+/* The pane is a column and its body a row: the scroller takes the width, the minimap and the
+   code column take theirs. Without this the scroller has no height to scroll in. */
+.hexbody { display: flex; flex: 1; min-height: 0; }
+.hexscroll { overflow: auto; min-height: 0; flex: 1; }
+/* No vertical scrollbar: the minimap beside it *is* the scroll indicator — it shows the whole window, marks
+   where the viewport is, and takes a click or a drag. A second bar next to it would say the same thing in
+   less detail. The horizontal one stays (there is nothing else to say "you are seeing 16 bytes of a wider
+   row"), thin and dark.
+   Styled with the WebKit pseudo-elements only: setting the standard `scrollbar-width`/`scrollbar-color`
+   makes Chromium ignore these, which is how a themed bar ended up looking like the platform's. */
+.hexscroll::-webkit-scrollbar { width: 0; height: 10px; }
+.hexscroll::-webkit-scrollbar-track { background: transparent; }
+.hexscroll::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 5px; border: 2px solid #0d1016; }
+.hexscroll::-webkit-scrollbar-thumb:hover { background: #3d4859; }
+.hexscroll::-webkit-scrollbar-corner { background: transparent; }
+/* `align-self: flex-start` because the box is a flex row: `flex: 0 0 auto` fixes its width, but the cross axis
+   still defaults to `stretch`, which made the element 530.75px tall while its bitmap was 521 — a 2% vertical
+   stretch of everything drawn on it. With the box equal to the bitmap, a mark at the bitmap's edge is at the
+   element's edge, which is what it looked like it was not. */
+.minimap { flex: 0 0 auto; align-self: flex-start; cursor: pointer; border-left: 1px solid var(--line); background: #0b0e14; }
+.hexhead {
+  display: flex; gap: 6px; align-items: baseline; position: sticky; top: -6px; z-index: 2;
+  padding: 4px 10px 6px; background: var(--panel); border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px;
+}
+/* The hex bytes and the structure overlay share one byte grid: 16 cells per row with the usual 9px gap
+   after the eighth, so a field's width is its byte count and its position is its offset. The cell size is
+   derived from the font (`2ch` = two hex digits), never guessed in pixels. */
+/* One set of column widths for every row and the ruler, computed from the font (`ch`), never guessed in
+   pixels — and deliberately not `subgrid`: sizing `max-content` tracks through a subgrid item that spans
+   all of them made Chromium hand back 1391px and 885px tracks, so every row overflowed the pane.
+   Each width includes that column's own rule and padding: `16ch` of ASCII in a cell that also spends 14px
+   on padding has a 92px content box for 106px of text, and the last two characters get covered by the
+   next column — which is a bug that looks exactly like a misalignment. */
+.hexpane {
+  --byte-cell: calc(2ch + 2px);
+  --byte-gap: 9px;
+  --bytes-w: calc(16 * var(--byte-cell) + var(--byte-gap));
+  --frames-w: 3.2ch;
+  --addr-w: 16ch;
+  --ascii-w: calc(16ch + 15px);
+  --overlay-w: calc(16 * var(--byte-cell) + 13px);
+}
+.hexpane.no-objects { --frames-w: 0px; --overlay-w: 0px; }
+.hexpane.ascii-aligned { --ascii-w: calc(var(--bytes-w) + 13px); }
+
+.hexrow {
+  display: grid;
+  grid-template-columns: var(--frames-w) var(--addr-w) var(--bytes-w) var(--ascii-w) var(--overlay-w);
+  column-gap: 12px; padding: 0 10px;
+  /* At least the pane's width, even when the content is narrower: the alternating row background is the
+     reader's guide down a long column, and it stopped at the last cell — so the right-hand end of every
+     other row was a different colour, which reads as a rendering fault rather than as a row. */
+  min-width: 100%;
+  font-family: var(--mono); font-size: 12px; line-height: 1.55; white-space: pre;
+}
+.hexrow:nth-child(even) { background: rgba(255, 255, 255, .015); }
+.hexrow:hover { background: var(--panel-2); }
+/* Same font size as the rows on purpose: the byte cell is `2ch + 2px`, and `ch` follows the font size, so
+   a smaller ruler would silently use smaller cells and line up with nothing. Dimmed, not shrunk. */
+/* The ruler sticks: a window is a whole region now (the stack here is 132 KB, a heap window can be
+   gigabytes), so the column numbers have to survive a scroll that is thousands of rows long.
+   Its background must be **opaque**: rows scroll underneath it, and `opacity` (or a translucent fill) lets
+   them show through the ruler — which reads as a misaligned row, not as a sticky header. The dimness comes
+   from the colour instead. */
+.hexrow.ruler { position: sticky; top: 0; z-index: 3; background: #0d1016; color: var(--anon); border-bottom: 1px solid var(--line); padding-bottom: 2px; margin-bottom: 2px; }
+/* A folded run of zero pages: one row standing in for thousands, saying how much and that nothing named is
+   inside it. Clicking puts the bytes back. */
+.hexrow.fold { display: block; padding: 0 10px; }
+.hexrow.fold .foldtext { display: block; color: var(--dim); font-family: var(--mono); font-size: 11px; background: rgba(109, 122, 144, .10); border: 1px dashed rgba(109, 122, 144, .45); border-radius: 3px; padding: 0 8px; cursor: pointer; }
+.hexrow.fold:hover .foldtext { color: var(--fg); background: rgba(109, 122, 144, .18); }
+/* The unbuilt rows of a virtualised pane: one empty element carrying their height, so the scrollbar is the
+   size of the window rather than the size of what happens to be rendered. */
+.rowgap { width: 100%; }
+.hexrow.ruler .haddr { color: var(--anon); }
+.rcell { grid-row: 1; text-align: center; }
+.hexrow.ruler .hascii, .hexrow.ruler .soverlay { border-left-color: transparent; }
+/* The frame around a structure: one glyph per row plus a connecting line, so a struct spanning three rows
+   reads as one box rather than three marks. */
+.sframes { display: flex; gap: 2px; align-items: stretch; }
+.sframe { color: var(--anon); border-left: 1px solid var(--line); padding-left: 3px; cursor: default; }
+.sframe.objhot { color: var(--fg); border-left-color: var(--fg); }
+.haddr { color: var(--anon); }
+/* The hex and ASCII columns group in eights — `0x0…0x7 | 0x8…0xf` — and the overlay column does not, because
+   there the gap would fall between two fields that are adjacent in memory. */
+.hbytes,
+.hascii.aligned {
+  display: grid;
+  grid-template-columns: repeat(8, var(--byte-cell)) var(--byte-gap) repeat(8, var(--byte-cell));
+}
+.soverlay {
+  display: grid;
+  grid-template-columns: repeat(16, var(--byte-cell));
+}
+.hbytes .byte { grid-row: 1; padding: 0 1px; border-radius: 2px; cursor: pointer; }
+.hbytes .byte:hover { background: var(--panel-2); color: var(--accent); }
+.hbytes .byte.sel { background: var(--accent); color: #071018; }
+.hbytes .byte.crashsite { outline: 1px solid var(--crash); border-radius: 2px; }
+.hbytes .byte.hole { color: #4a5262; }
+/* Compact ASCII: 6.6px per character, which is what makes a string readable as a string. */
+.hascii { color: var(--dim); border-left: 1px solid var(--line); padding-left: 14px; }
+/* Aligned ASCII: the byte grid again — one character centred in each byte's cell, group gap included, so
+   character 9 sits where byte 9 does. */
+.hascii.aligned { padding-left: 12px; }
+.hascii.aligned .achar { grid-row: 1; text-align: center; }
+/* No `grid-row` here: a grid item with an explicit row position is placed *before* the auto-placed ones,
+   so declaring a row on this cell alone silently moves it to column 1 and shifts the whole row. */
+.soverlay { border-left: 1px solid var(--line); padding-left: 12px; }
+
+/* A field is drawn in the cells of the bytes it occupies — including the group gap when it spans it —
+   so the label has to be clipped rather than allowed to push the box wider than its bytes.
+   Slim on purpose: a fixed height with `align-self: center` keeps the box off the row's edges, and unlike a
+   vertical margin it does not make the cell's outer box taller than the row, so every row stays one height. */
+.scell {
+  grid-row: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  align-self: center; height: 17px; line-height: 17px;
+  margin: 0 1px; padding: 0 3px; border-radius: 3px;
+}
+button.scell {
+  appearance: none; border: none; font: inherit; text-align: left;
+  cursor: pointer; width: 100%; box-sizing: border-box;
+}
+.scell.field.continued { font-style: italic; }
+/* The bytes carry on into the next row: the box's right edge says so, because a trailing character would
+   be the first thing `text-overflow` removes. */
+.scell.field.continues { border-top-right-radius: 0; border-bottom-right-radius: 0; box-shadow: inset -2px 0 0 -1px rgba(216, 221, 230, .35); }
+.scell.hole { color: var(--anon); font-style: italic; font-size: 10.5px; background: rgba(226, 232, 240, .06); }
+/* The structure's own bytes as a hairline of backing behind the fields: enough to show that the bytes are
+   one run and to keep the group gap from cutting it, faint enough that the field boxes stay the shape you
+   read. It is not a slab — the fields are the thing. */
+.sband { grid-row: 1; align-self: center; height: 17px; background: rgba(226, 232, 240, .055); border-radius: 3px; }
+.sband.objhot { background: rgba(226, 232, 240, .14); }
+
+/* Field identity cycles through five hues, like bracket colourisation. One hue, two strengths: solid means
+   the field leads somewhere and can be clicked, faint means it is just a value. */
+.hue0 { --hue: 98, 168, 255; }
+.hue1 { --hue: 197, 139, 255; }
+.hue2 { --hue: 127, 209, 139; }
+.hue3 { --hue: 255, 196, 107; }
+.hue4 { --hue: 255, 138, 168; }
+
+/* Three tones, each meaning one thing. `--tint` is the only thing a tone sets; every rule below reads it,
+   so adding a meaning means adding one line here and one place that assigns it. */
+.tone-leads { --tint: 98, 168, 255; }
+.tone-value { --tint: 138, 147, 163; }
+.tone-warn { --tint: 255, 107, 107; }
+
+.hbytes .byte.owned { background: rgba(var(--tint), .15); border-radius: 0; }
+.hbytes .byte.owned.starts { box-shadow: inset 1px 0 0 rgba(var(--tint), .95); }
+.hbytes .byte.owned.hot { background: rgba(var(--tint), .45); }
+/* Clicking a byte chooses its field; the choice stays lit while the mouse moves on. */
+.hbytes .byte.owned.chosen { background: rgba(var(--tint), .55); color: #0b0e13; }
+
+/* Two strengths of one tone, alternating field by field: that is what separates neighbours, so no box
+   needs a border and the colour stays free to mean something. */
+.scell.field { color: var(--fg); background: rgba(var(--tint), .08); }
+.scell.field.s0 { background: rgba(var(--tint), .16); }
+.scell.field.leads { font-weight: 600; color: #eaf2ff; background: rgba(var(--tint), .34); }
+.scell.field.leads.s0 { background: rgba(var(--tint), .46); }
+.scell.field.tone-warn { color: rgb(var(--tint)); }
+/* A continuation carries the rest of its field's label, so it is text, not a block: the same tone, a little
+   dimmer, still visible against the strip behind it. */
+.scell.field.continued { background: rgba(var(--tint), .12); font-weight: 400; }
+.scell.field.hot { background: rgba(var(--tint), .62); color: #0b0e13; }
+.scell.field.chosen { outline: 2px solid var(--accent); outline-offset: -1px; background: rgba(98, 168, 255, .22); }
+button.scell.field.leads:hover { outline: 1px solid rgba(var(--tint), .9); }
+
+/* Union members and bit-fields that share their bytes with the row above: listed, but visibly second. */
+
+.overlay-legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; padding: 4px 10px 6px; font-size: 11px; color: var(--dim); }
+.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.legend-swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; background: rgba(var(--tint), .55); }
+/* The field rail: the complete field list, beside the bytes. Values wrap rather than clip — the whole point
+   of the rail is that the overlay's labels do not fit between two byte columns. */
+.srail { overflow: auto; min-height: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 6px 0 24px; }
+.rail-head { display: flex; gap: 8px; align-items: baseline; padding: 4px 10px 6px; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--line); }
+.rail-head .expr { font-weight: 600; }
+.rail-head .ftype { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Variables of a frame that have no bytes in it: a register, a fixed address, or optimised away. There is
+   nothing to draw on the bytes, so they are listed by name, value and *where*. */
+.away { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; gap: 0 8px; align-items: baseline; padding: 2px 0; font-family: var(--mono); font-size: 11.5px; }
+.away .name { color: var(--fg); }
+.away .value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.away .place { color: var(--anon); font-size: 10.5px; }
+.rail-notes { padding: 4px 10px 6px; font-size: 11px; color: var(--dim); border-bottom: 1px solid var(--line); }
+.rail-notes.suspect { color: #f0b6a8; }
+.rail-empty { padding: 10px; font-size: 11.5px; }
+.rail-rows { padding-top: 4px; }
+/* The tree: twisty · swatch · name · value, with `type · offset · size` on a second line under the name.
+   Indentation is the row's `padding-left`, so a `{` and its `}` line up with the field name they belong to. */
+/* The tree: twisty · swatch · name · `= value`, one line per field (the Lauterbach convention). The name
+   column is a *fixed* width so all the `=` line up at a given depth — each row is its own grid, and a
+   `max-content` name column puts every `=` in a different place. The type, offset and size are in the
+   tooltip: a second line per field doubled every row's height and made the tree unreadable. */
+.rail-row { display: grid; grid-template-columns: 14px 12px 13ch minmax(0, 1fr); gap: 0 5px; align-items: baseline; padding: 1px 10px; cursor: pointer; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
+.rail-row:hover { background: var(--panel-2); }
+.rail-row.selected { background: rgba(98, 168, 255, .14); }
+.rail-row.hole { color: var(--anon); font-style: italic; cursor: default; }
+.rail-row .twisty { color: var(--dim); }
+.rail-row .swatch::before { content: ""; display: block; width: 7px; height: 7px; border-radius: 2px; background: rgba(var(--tint), .9); }
+.rail-row .swatch { align-self: center; }
+.rail-row .name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-row .eq { color: var(--line); }
+.rail-row .value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brace { color: var(--anon); font-family: var(--mono); font-size: 12px; line-height: 1.3; padding: 0 10px; }
+.section { padding: 6px 0 12px; border-bottom: 1px solid rgba(42, 48, 64, .6); }
+.section:last-child { border-bottom: none; }
+.section h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+.aliases { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; font-size: 11.5px; }
+.chip.cycle { color: var(--stack); border-color: var(--stack); }
+.fval { font-family: var(--mono); font-size: 12px; }
+.fval.muted { color: var(--anon); font-style: italic; }
+.fval.string { color: var(--read); }
+.fval.bad { color: var(--anon); text-decoration: line-through; }
+/* One look for "this is a place you can go", wherever it is written: a pointer in the typed rail, a
+   target in an instruction, an address on a field row. Sharing the rule is the point — two rules with the same
+   intent drift, and then two links that mean the same thing look like two different things. */
+button.fval.jump,
+.coderail .ctarget { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+button.fval.jump:hover,
+.coderail .ctarget:hover { text-decoration: underline; }
+button.fval.jump.visited { color: var(--stack); }
+.notindump { max-width: 640px; margin: 24px auto; padding: 16px 18px; background: var(--panel); border: 1px solid var(--crash); border-radius: 6px; }
+.notindump h3 { margin: 0 0 6px; color: var(--crash); font-size: 14px; font-family: var(--mono); }
+.notindump p { color: var(--fg); margin: 4px 0; }
+/* Mapped, but no bytes in this demo: a limitation, not a failure — so it must not look like one. */
+.hexempty { max-width: 560px; margin: 28px auto; padding: 0 18px; }
+.hexempty h3 { margin: 0 0 8px; font-size: 14px; color: var(--fg); }
+.hexempty p { color: var(--fg); margin: 6px 0; }
+
+
+/* ---------- state screens ---------- */
+/* Same rule as `.layout`: fill what is left rather than assume a chrome height. It keeps the card centred in
+   the main column, which is what it does on the empty screen and on every state screen. */
+.screen { display: grid; place-items: center; flex: 1 1 auto; min-height: 0; }
+.card { width: min(560px, 90vw); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 20px 22px; }
+.card h2 { margin: 0 0 4px; font-size: 15px; }
+.card p { color: var(--dim); margin: 6px 0 14px; }
+.card label { display: block; color: var(--dim); font-size: 11.5px; margin: 10px 0 3px; }
+.card input, .card select {
+  width: 100%; background: #0d1016; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 5px; padding: 6px 8px; font-family: var(--mono); font-size: 12px;
+}
+.card .actions { display: flex; gap: 8px; margin-top: 16px; }
+.card.err h2 { color: var(--crash); }
+.card .code { font-family: var(--mono); color: var(--exec); }
+.bar-outer { height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden; margin-top: 12px; }
+.bar-inner { height: 100%; width: 35%; background: var(--accent); animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+
+/* ---------- dev bar + toast ---------- */
+#devbar {
+  display: flex; align-items: center; gap: 6px; padding: 6px 12px;
+  background: var(--panel); border-top: 1px solid var(--line); font-size: 11.5px;
+}
+#devbar .dim { color: var(--dim); }
+#devbar button { padding: 1px 7px; font-size: 11.5px; }
+#devbar button.active { background: var(--accent); color: #071018; border-color: var(--accent); }
+#datasource { margin-left: auto; font-family: var(--mono); }
+
+/* ---------- visible failure modes (so a black page explains itself) ---------- */
+#errors:empty { display: none; }
+#errors {
+  position: fixed; inset: 0 0 auto 0; z-index: 10;
+  background: #2a1416; border-bottom: 1px solid var(--crash); padding: 6px 12px;
+}
+.error-line { font-family: var(--mono); font-size: 12px; color: #ffb3b3; }
+
+.boot-hint { max-width: 620px; margin: 12vh auto 0; padding: 0 20px; }
+.boot-hint h2 { margin: 0 0 6px; font-size: 15px; }
+.boot-hint p, .boot-hint li { color: var(--dim); }
+.boot-hint code { font-family: var(--mono); background: var(--panel); padding: 1px 5px; border-radius: 3px; color: var(--fg); }
+
+.toast {
+  position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%);
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--exec);
+  border-radius: 5px; padding: 7px 12px; font-family: var(--mono); font-size: 12px; max-width: 70vw;
+}
+
+/* --------------------------------------------------------------------------- */
+.codesection { margin: 10px 14px 40px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); }
+.codesection-head { padding: 7px 12px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12px; color: var(--crash); }
+.codesection-body { padding: 8px 12px; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; }
+.codesection .codelisting { padding: 8px 12px; }
+
+/* --------------------------------------------------------------------------- */
+/* code beside the bytes: instruction boxes and the source they came from
+/*
+/* Boxed like the overlay's field cells, because both answer the same question — "what is this piece of
+/* memory" — and the box is what says where one piece ends and the next begins. No address inside the box:
+/* the hex row's own gutter has it, and repeating it is what pushed the mnemonics off the edge. */
+/* --------------------------------------------------------------------------- */
+.ccolumn { display: flex; flex-direction: column; }
+.cgroup { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px; align-items: start; }
+.cgroup + .cgroup { margin-top: 3px; }
+.cinsns { display: flex; flex-direction: column; }
+.cbox {
+  display: flex; gap: 6px; align-items: baseline; text-align: left;
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 0 6px; margin: 1px 0; white-space: pre; cursor: pointer;
+}
+.cbox:hover { border-color: var(--accent); }
+.cbox.crashsite { border-color: var(--crash); color: var(--crash); background: rgba(255, 107, 107, .12); }
+.cbox .imark { color: var(--crash); font-size: 10.5px; }
+.csource { display: flex; gap: 8px; font-family: var(--mono); font-size: 11.5px; padding-top: 1px; }
+.csource .clineno { color: var(--anon); flex: 0 0 auto; }
+.csource .ctext { color: var(--fg); white-space: pre-wrap; }
+.csource .ctext.nosource { color: var(--dim); font-style: italic; }
+
+/* A code window needs a wider last column than a structure overlay does: an instruction box holds a whole
+   mnemonic with operands, and beside it the source line — neither fits in the 16-byte track the overlay
+   uses. The bytes, the ASCII and the addresses keep the widths they had; this only takes the room the
+   overlay column was reserving and never used on a code window. */
+.hexpane.is-code { --overlay-w: minmax(320px, 1fr); }
+
+/* Match the overlay's cells, one notch smaller.
+/*
+/* The overlay is the reference the reader already has: a filled cell with a bright hairline border, 17px
+/* tall, holding one piece of information about the bytes beside it. Measured against it, the instruction
+/* boxes were taller (19.8px) and empty, and the mnemonics sat at 11.5px against its 10.5px secondary text.
+/* An instruction is secondary text next to the bytes it came from, so it takes that size. */
+/* --------------------------------------------------------------------------- */
+.hexpane.is-code .cbox {
+  font-size: 10.5px; line-height: 16px; padding: 0 4px; margin: 0 0 1px;
+  background: rgba(138, 147, 163, .16); border: 1px solid rgba(216, 221, 230, .35);
+  border-radius: 3px; color: #d8dde6;
+}
+.hexpane.is-code .cbox:hover { border-color: var(--accent); background: rgba(143, 182, 255, .18); }
+.hexpane.is-code .cbox.crashsite {
+  border-color: var(--crash); color: var(--crash); background: rgba(255, 107, 107, .16);
+}
+.hexpane.is-code .csource { font-size: 10.5px; line-height: 16px; }
+.hexpane.is-code .csource .ctext { color: var(--dim); }
+.hexpane.is-code .csource .clineno { color: var(--anon); }
+
+/* One line per row of bytes: the source chip, then the instruction chips, running to the right. The row is
+   as wide as its widest listing and the hex pane scrolls horizontally to reach the rest — the same gesture
+   that already reaches the right-hand bytes of a wide row. No wrapping: a wrapped chip is a row that has
+   quietly become two lines, which is the lurch this layout exists to avoid. */
+.hexpane.is-code { --overlay-w: max-content; }
+.hexpane.is-code .ccolumn { display: flex; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 6px; white-space: nowrap; }
+.hexpane.is-code .ccolumn .cbox { margin: 0; }
+.hexpane.is-code .csource {
+  display: flex; gap: 6px; align-items: baseline; padding: 0 4px;
+  font-family: var(--mono); font-size: 10.5px; line-height: 16px;
+  color: var(--dim); border-left: 2px solid var(--line); padding-left: 6px;
+}
+.hexpane.is-code .csource .clineno { color: var(--anon); }
+.hexpane.is-code .csource.nosource .ctext { font-style: italic; }
+
+/* Fixed-width instruction cells, the way the overlay does it.
+/*
+/* A struct's cell is as wide as the bytes it covers and its label is elided to fit; an instruction cell that
+/* grows to fit its mnemonic is the opposite discipline — one long `b.eq … <plugin_crash+168>` then pushes
+/* every later cell to its right, and the row's width becomes whatever the longest operand happened to be.
+/* So: one width for every cell, ellipsis when the mnemonic does not fit, and the full text in the tooltip,
+/* which is already there. */
+/* --------------------------------------------------------------------------- */
+.hexpane.is-code .ccolumn { gap: 4px; }
+.hexpane.is-code .ccolumn .cbox {
+  width: 27ch; flex: 0 0 auto; overflow: hidden;
+}
+.hexpane.is-code .ccolumn .cbox .mnemonic {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hexpane.is-code .ccolumn .cbox .imark { flex: 0 0 auto; }
+
+/* --------------------------------------------------------------------------- */
+/* the code rail: source and assembly, editor style
+/*
+/* Line-number gutter, a tint per token kind, and the crash instruction marked the way it is everywhere else.
+/* Reads as code because it is laid out like code — which is what the hex-side chips deliberately are not:
+/* those are a map ("this byte, that instruction"), this is the listing. */
+/* --------------------------------------------------------------------------- */
+.coderail { padding: 0; }
+.coderail .rail-head { position: sticky; top: 0; background: var(--panel); z-index: 2; border-bottom: 1px solid var(--line); }
+.cunit { border-bottom: 1px solid var(--line); padding: 4px 0 6px; }
+.cunit-head { padding: 3px 10px 2px; font-family: var(--mono); font-size: 11px; }
+.cunit-head .cfun { color: var(--exec); }
+.coderail .csrc, .coderail .cinsn { display: grid; grid-template-columns: 4.5ch 1fr; gap: 8px; padding: 0 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; }
+.coderail .csrc { background: rgba(255, 255, 255, .022); }
+.coderail .cln { color: var(--anon); text-align: right; }
+.coderail .ct { white-space: pre-wrap; color: var(--fg); }
+.coderail .cop { white-space: pre; color: #cfd6e2; }
+.coderail .csrc .kw { color: #c792ea; }
+.coderail .csrc .st { color: #a5d6a7; }
+.coderail .csrc .cm { color: #6b7a90; font-style: italic; }
+.coderail .csrc .nu { color: #f0b866; }
+.coderail .nosource { color: var(--dim); font-style: italic; }
+.coderail .cinsn .cln { color: #343c4a; }
+.coderail .cinsn.crashsite { background: rgba(255, 107, 107, .14); }
+.coderail .cinsn.crashsite .cop { color: var(--crash); }
+
+/* One selection, three places: the bytes it covers, the chip, and the rail line. The same tint in all three,
+   because a reader who has to check which of three outlines match is reading the highlight instead of the
+   code. */
+.hexpane.is-code .hbytes .byte.insnsel { background: rgba(143, 182, 255, .28); outline: 1px solid rgba(143, 182, 255, .55); border-radius: 2px; }
+.hexpane.is-code .cbox.selected { border-color: var(--accent); background: rgba(143, 182, 255, .28); color: var(--fg); }
+.coderail .cinsn.selected { background: rgba(143, 182, 255, .18); }
+.coderail .cinsn.selected .cop { color: var(--fg); }
+.coderail .cinsn { cursor: pointer; }
+.coderail .cinsn:hover { background: rgba(255, 255, 255, .04); }
+
+/* The rail's scrollbar, and no horizontal scrolling in it.
+/*
+/* The default scrollbar is a light slab in a dark pane — the same complaint the hex pane already answered.
+/* And a rail that scrolls sideways hides the end of every long operand behind a gesture nobody expects:
+/* an instruction is prose, so it wraps. Only the rail: the hex-side chips stay fixed-width with an ellipsis,
+/* because there the width *is* the grid, and a chip that wrapped would break the columns it sits in. */
+/* --------------------------------------------------------------------------- */
+.srail.coderail { overflow-x: hidden; scrollbar-width: thin; scrollbar-color: #2a3242 transparent; }
+.srail.coderail::-webkit-scrollbar { width: 10px; height: 0; }
+.srail.coderail::-webkit-scrollbar-track { background: transparent; }
+.srail.coderail::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 5px; border: 2px solid var(--panel); }
+.srail.coderail::-webkit-scrollbar-thumb:hover { background: #3d4859; }
+.srail.coderail::-webkit-scrollbar-corner { background: transparent; }
+.coderail .csrc, .coderail .cinsn { grid-template-columns: 4.5ch minmax(0, 1fr); }
+.coderail .cop { white-space: pre-wrap; overflow-wrap: anywhere; }
+.coderail .ct { overflow-wrap: anywhere; }
+
+/* Registers: a name and a value, not a structure dump.
+/*
+/* An aggregate (a SIMD register) is set in a dimmer, monospaced run of hex words — it is data, not a place, so
+/* it is deliberately not styled like the jumpable addresses beside it. */
+table.regs td.value.aggregate { color: var(--dim); font-size: 11.5px; letter-spacing: .02em; }
+table.regs td.value.jump { color: var(--accent); cursor: pointer; text-decoration: none; }
+table.regs td.value.jump:hover { text-decoration: underline; }
+
+/* --------------------------------------------------------------------------- */
+/* the dev bar's right-hand side is a log, and the current coredump is lit
+/*
+/* The newest event is always on the bar (monospace, so timestamps line up); clicking opens the history above
+/* it. The live loading line is dimmer and italic, because it is a progress line rather than something that
+/* happened.
+/* --------------------------------------------------------------------------- */
+#devbar #logline { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); cursor: pointer; max-width: 62ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; border-radius: 3px; }
+#devbar #logline:hover { color: var(--fg); background: rgba(255, 255, 255, .05); }
+#devbar #logline.live { color: var(--accent); font-style: italic; }
+#devbar #logpanel { position: absolute; right: 10px; bottom: calc(100% + 4px); width: min(90ch, 70vw); max-height: 220px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--dim); white-space: pre; box-shadow: 0 6px 20px rgba(0, 0, 0, .4); }
+#devbar #logpanel > div:last-child { color: var(--fg); }
+#devbar { position: relative; }
+/* The coredump whose data is on screen — the same accent the rest of the app uses for "this is the one". */
+#samples .chip.active { border-color: var(--accent); background: rgba(143, 182, 255, .18); color: var(--fg); }
+
+/* One state indicator, in place of five buttons. The stages are sequential — asked for, being read, then
+   answering, failed, or reclaimed for being idle — so the bar reports the stage instead of offering all five
+   at once. The colour carries the reading and the word carries the name, so it does not rely on colour alone. */
+#statebadge { display: inline-block; min-width: 6.5ch; text-align: center; font-family: var(--mono); font-size: 11px; padding: 1px 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+#statebadge[data-state="empty"] { border-color: var(--line); }
+#statebadge[data-state="loading"] { border-color: var(--accent); background: rgba(98, 168, 255, .12); }
+#statebadge[data-state="ready"] { border-color: var(--read); background: rgba(127, 209, 139, .12); }
+#statebadge[data-state="failed"] { border-color: var(--crash); background: rgba(255, 107, 107, .14); }
+#statebadge[data-state="expired"] { border-color: var(--exec); background: rgba(255, 196, 107, .12); }
+
+/* Why a load by path failed, on the form beside the fields to correct. */
+.formerror { color: var(--crash); font-size: 12px; margin: 2px 0 6px; font-family: var(--mono); word-break: break-all; }
+
+/* The chip for a core loaded by path, beside the shipped samples. */
+#samples .chip.custom { border-style: dashed; }
+
+
+
+/* Cores opened before: the page's left rail, the same .aside the threads pane uses, with the same row metrics —
+   padding 5px 12px, mono 11.5px, a left border for the current one — so the rail reads as part of this application
+   rather than as something new bolted beside it. */
+.recent { display: flex; flex-direction: column; }
+.recent-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 0 6px;
+  padding: 5px 12px; border-left: 2px solid transparent;
+  /* The whole row is the target — the path under the name is part of the same choice. `user-select: none` because
+     the row is a control, not prose: without it a drag selects the path and the cursor over it is an I-beam, which
+     is what made the second line look unresponsive. */
+  cursor: pointer; user-select: none;
+}
+.recent-row:hover { background: var(--panel-2); }
+.recent-row:hover .recent-open { color: var(--accent); }
+.recent-row.gone .recent-open { color: var(--dim); text-decoration: line-through; }
+.recent-open {
+  grid-column: 1; background: none; border: none; padding: 0; text-align: left;
+  color: var(--fg); font-family: var(--mono); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.recent-dir { grid-column: 1; font-family: var(--mono); font-size: 10.5px; color: var(--anon); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.recent-why { grid-column: 1; font-family: var(--mono); font-size: 10.5px; }
+/* The one control inside the row, so it keeps its own cursor and stops the click from opening the core. */
+.recent-forget { grid-column: 2; grid-row: 1; background: none; border: none; cursor: pointer; font-size: 11px; padding: 0 2px; }
+.recent-forget:hover { color: var(--fg); }
+.formnote { font-family: var(--mono); font-size: 11px; margin: 1px 0 4px; }
+
+/* The "+" that opens another core: same chip shape, quieter, because it is not a core. */
+#samples .chip.open { font-weight: 600; padding: 1px 9px; color: var(--dim); }
+#samples .chip.open:hover { color: var(--accent); border-color: var(--accent); }
+
+/* A loaded core's tab: the name opens it, the × closes its session. The chip is the frame; the two controls inside
+   it are plain text, because a tab is one object with two actions, not two buttons that happen to touch. */
+#samples .chip.loaded { display: inline-flex; align-items: center; gap: 2px; padding: 0 4px 0 7px; }
+#samples .chip.loaded button { background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: inherit; }
+#samples .chip.loaded button.name { max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#samples .chip.loaded button.x { color: var(--dim); font-size: 13px; line-height: 1; padding: 0 1px; border-radius: 3px; }
+#samples .chip.loaded button.x:hover { color: var(--fg); background: rgba(255, 255, 255, .12); }
+
+
+/* The one byte the reader asked for. A ring plus a solid fill, because a selection in the bytes is a single address
+   and it has to be findable at a glance among sixteen. The *field* around it is expressed elsewhere — by the chosen
+   bytes' own tint and by the overlay box's accent outline — not by a wash over this byte's neighbours. */
+.hexrow .byte.sel { box-shadow: inset 0 0 0 1px var(--accent), inset 0 -2px 0 var(--accent); }
+
+/* The object a jump landed in, when the address is the object itself rather than one of its fields: the rail's own
+   header is the only row that describes it, so that is what gets marked. Without this a jump to a frame's base lit
+   the bytes and left the struct rail looking untouched — there is no field row to highlight. */
+.rail-head.selected { background: rgba(98, 168, 255, .16); box-shadow: inset 2px 0 0 var(--accent); }
+
+/* The selected byte, at the specificity of the fill it sits on: it is usually also the first byte of its field, so it
+   has to beat that field's tint rather than be washed out by it. */
+.hexrow .hbytes .byte.sel { background: var(--accent); color: #071018; box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* The overlay frame of the selected object, so the third surface says the same thing as the bytes and the rail. */
+.hexrow .sframe.chosen { background: rgba(98, 168, 255, .28); box-shadow: inset 0 0 0 1px var(--accent); }
