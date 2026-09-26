@@ -8,11 +8,13 @@ logic in the wrong layer.
 from __future__ import annotations
 
 import pathlib
+import re
 import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from analysis.gdb.base import GdbError, Unsupported
 from analysis.session import Session, SessionManager
 from schema import (
     CONTRACT,
@@ -20,12 +22,16 @@ from schema import (
     CreatedSession,
     Defaults,
     DisassemblyPage,
+    ExpandRequest,
+    Expanded,
     FrameVariable,
     Health,
     MemoryWindow,
     OpenSession,
     ProcessStats,
+    Registers,
     SessionStats,
+    Symbolized,
     RecentEntry,
     Sample,
     SessionDetail,
@@ -63,6 +69,41 @@ def _root(request: Request) -> pathlib.Path:
 
 def _bundle(request: Request) -> pathlib.Path:
     return request.app.state.bundle
+
+
+_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\s:*\[\]]*$")
+_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+"""What a type or a field name is allowed to look like.
+
+The expression is composed by this layer and never typed by a caller (`architecture.md` §4), so the two pieces
+that go into it are checked against the shape of a C type and a C identifier. A value that is not one is a
+refusal, not something to hand to gdb and hope.
+"""
+
+
+def _compose_expression(body: ExpandRequest) -> str:
+    """One step of the typed walk, from something already on screen.
+
+    `(*(struct node *)0xc9bc79ad42a0).next` and, with `follow`, `*((*(struct node *)0xc9bc79ad42a0).next)` —
+    which is `parent->next` written the long way round. The API builds it, so no caller ever writes C.
+    """
+    address = body.address.strip()
+    if not address.startswith("0x"):
+        try:
+            address = hex(int(address, 16))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"an address must be hexadecimal, not {body.address!r}") from exc
+    if not _TYPE_RE.match(body.type.strip()):
+        raise HTTPException(status_code=400, detail=f"{body.type!r} is not a type name this API will compose with")
+    if body.field is not None and not _FIELD_RE.match(body.field):
+        raise HTTPException(status_code=400, detail=f"{body.field!r} is not a field name this API will compose with")
+
+    expression = f"*({body.type.strip()} *){address}"
+    if body.field:
+        expression = f"({expression}).{body.field}"
+    if body.follow:
+        expression = f"*({expression})"
+    return expression
 
 
 def _recent(request: Request) -> Recent:
@@ -361,6 +402,14 @@ def object_at(session_id: str, request: Request, address: str) -> dict:
     summary = _with_summary(session)
     from analysis import queries
 
+    if not (summary.get("typed") or {}).get("objects"):
+        # Said plainly, because the alternative is a 404 that reads like a typing mistake. The live summary is
+        # built without the typed index (it is the demo profile that pre-fetches it), so "what type is at this
+        # address" has no answer to give here — and `POST /expand` is the way to ask with a type named.
+        raise HTTPException(
+            status_code=404,
+            detail="this session holds no typed index: name the type instead (POST /expand)",
+        )
     found = queries.object_at(summary, int(address, 16))
     if found is None:
         raise HTTPException(status_code=404, detail=f"no type is known for {address}")
@@ -368,16 +417,126 @@ def object_at(session_id: str, request: Request, address: str) -> dict:
 
 
 @router.get("/sessions/{session_id}/stack", response_model=Stack)
-def stack(session_id: str, request: Request, thread: int | None = None, levels: int | None = None) -> dict:
-    """The stack walk for one thread — the on-demand form of what the summary pre-fetches for the first screen."""
+def stack(
+    session_id: str,
+    request: Request,
+    thread: int | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+    levels: int | None = None,
+) -> dict:
+    """The stack walk for one thread — the on-demand form of what the summary pre-fetches for the first screen.
+
+    `offset`/`limit` page it (requirements §5), and the answer carries `total` and `truncated`, because a
+    truncated stack that does not say it is truncated is a hole the reader cannot tell from the end of the
+    stack.
+    """
+    if levels is not None:
+        # Refused rather than ignored: a query parameter that is silently dropped answers a different question
+        # than the one that was asked, and the caller has no way to notice.
+        raise HTTPException(status_code=400, detail="`levels` was replaced by `limit`, and `offset` pages it")
     session = _ready(request, session_id)
     summary = _with_summary(session)
     from analysis import report
 
+    threads = summary["threads"]
     number = thread if thread is not None else next(
-        (t["num"] for t in summary["threads"] if t["is_crashed"]), summary["threads"][0]["num"]
+        (t["num"] for t in threads if t["is_crashed"]), threads[0]["num"]
     )
-    return report.stack_detail(session.transport, number, levels)
+    if number not in {t["num"] for t in threads}:
+        raise HTTPException(status_code=404, detail=f"this dump has no thread {number}")
+    if offset < 0 or (limit is not None and limit < 1):
+        raise HTTPException(status_code=400, detail="offset must be >= 0 and limit >= 1")
+    return report.stack_detail(session.transport, number, offset=offset, limit=limit)
+
+
+@router.get("/sessions/{session_id}/threads/{num}/registers", response_model=Registers)
+def thread_registers(session_id: str, num: int, request: Request) -> dict:
+    """One thread's registers, on demand.
+
+    §13.2 says clicking a frame shows its registers; the summary only carries the **crashed** thread's, so
+    without this every other thread's registers were unreachable and the promise held for exactly one thread.
+    """
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
+    if num not in {t["num"] for t in summary["threads"]}:
+        raise HTTPException(status_code=404, detail=f"this dump has no thread {num}")
+    return {"thread": num, "registers": session.transport.registers(num)}
+
+
+@router.post("/sessions/{session_id}/expand", response_model=Expanded)
+def expand(session_id: str, body: ExpandRequest, request: Request) -> dict:
+    """One level of a typed object — §13.5's one click, with the type named by the caller.
+
+    The composition is the rule `architecture.md` §4 states: a step is always from something already on
+    screen, so the caller sends the address, the type it is interpreting those bytes as, and (for a step into
+    a field) the field's name and whether the parent is a pointer. No expression is ever typed by a user.
+
+    A dump without DWARF cannot do this at all, and §13.6 says that must be *stated*: it answers **501** with
+    the capability's own note rather than an empty structure tree.
+    """
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
+    caps = summary["session"].get("capabilities") or {}
+    if not caps.get("dwarf_types"):
+        note = (caps.get("notes") or {}).get("dwarf_types") or "dwarf_types is false for this dump"
+        raise Unsupported(f"there is no type to expand here: {note}")
+
+    expression = _compose_expression(body)
+    return session.transport.expand(expression)
+
+
+@router.get("/sessions/{session_id}/symbolize", response_model=Symbolized)
+def symbolize(session_id: str, request: Request, address: str) -> dict:
+    """C4's one deterministic step: what an address belongs to.
+
+    Three answers, each of which may be absent with its reason in `why`: the mapping it is in (from the core's
+    own map, so "not in this dump" is a normal result), the function gdb says contains it (the address form of
+    a disassembly refuses for data instead of inventing an instruction), and — when the mapping is a stack —
+    the thread whose stack pointer is inside it.
+    """
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
+    try:
+        value = int(address, 16)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"an address must be hexadecimal, not {address!r}") from exc
+
+    why: dict[str, str] = {}
+    segment = next(
+        (
+            region
+            for region in summary["memory_map"]["regions"]
+            if int(region["start"], 16) <= value < int(region["end"], 16)
+        ),
+        None,
+    )
+    if segment is None:
+        why["segment"] = "this address is not in this dump"
+
+    function = None
+    try:
+        function = session.transport.disassemble(address).get("function") or None
+        if function is None:
+            why["function"] = "this address is in code but gdb named no function for it"
+    except GdbError as exc:
+        # gdb's refusal *is* the answer here: "No function contains specified address" is what data looks
+        # like, and it is a result rather than an error (the same rule `analysis/queries.py` follows).
+        why["function"] = str(exc).splitlines()[0][:200]
+
+    thread = None
+    if segment is not None and segment.get("kind") == "stack":
+        for candidate in summary["threads"]:
+            sp = int(session.transport.registers(candidate["num"]).get("sp") or "0x0", 16)
+            if int(segment["start"], 16) <= sp < int(segment["end"], 16):
+                thread = candidate["num"]
+                break
+        if thread is None:
+            why["thread"] = "this is a stack mapping, but no thread's stack pointer is inside it"
+    else:
+        why["thread"] = "this address is not in a stack mapping"
+
+    return {"address": address, "segment": segment, "function": function, "thread": thread, "why": why}
 
 
 @router.get("/sessions/{session_id}/objects", response_model=list[TypedObject])

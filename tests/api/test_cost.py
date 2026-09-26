@@ -32,13 +32,13 @@ def test_a_request_reports_what_it_cost(live, open_session) -> None:
     body = open_session(live, sample="crash_target")
     session = body["id"]
 
-    first = live.get(f"/api/sessions/{session}/stack", params={"thread": 1, "levels": 3})
+    first = live.get(f"/api/sessions/{session}/stack", params={"thread": 1, "limit": 3})
     assert first.status_code == 200, first.text
     asked = int(first.headers["x-gdb-commands"])
     assert asked > 0, "the first answer has to be asked for"
     assert first.headers["x-gdb-cached"] == "false"
 
-    again = live.get(f"/api/sessions/{session}/stack", params={"thread": 1, "levels": 3})
+    again = live.get(f"/api/sessions/{session}/stack", params={"thread": 1, "limit": 3})
     assert again.headers["x-gdb-commands"] == "0", "the same question went back to gdb"
     assert again.headers["x-gdb-cached"] == "true"
     assert again.json() == first.json(), "and it answered the same thing, from the session"
@@ -53,7 +53,7 @@ def test_the_stats_say_the_core_was_loaded_once(live, open_session) -> None:
     body = open_session(live, sample="crash_target")
     session = body["id"]
     for path, params in (
-        ("stack", {"thread": 1, "levels": 2}),
+        ("stack", {"thread": 1, "limit": 2}),
         ("frames/0", {"thread": 1}),
         ("memory", {"address": "0x0", "length": 8}),
         ("disassemble", {"address": body["summary"]["detail"]["1"]["frames"][0]["pc"]}),

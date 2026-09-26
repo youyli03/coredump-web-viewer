@@ -235,6 +235,69 @@ class Stack(Permissive):
     thread: int
     frames: list[dict[str, Any]]
     slots: dict[str, list[dict[str, Any]]] | None = None
+    total: int | None = None
+    """How many frames the thread has, so `limit`/`offset` (requirements §5) can be honest about what is out
+    of view instead of looking like the whole stack."""
+    offset: int = 0
+    limit: int | None = None
+    truncated: bool = False
+
+
+class Registers(Permissive):
+    """One thread's registers. §13.2 promises them for *a* frame, not only for the crashed thread's."""
+
+    thread: int
+    registers: dict[str, Any]
+
+
+class ExpandRequest(Permissive):
+    """One typed step, with the type named by the caller.
+
+    The caller names it because a `void *` has no type to look up and guessing one is worse than showing the
+    bytes (`docs/requirements.md` §4: "show the raw bytes plus an interpret-as… picker"). The three steps are
+    composed by the API, never typed by a caller:
+
+        `*(type *)address`                        the object those bytes are
+        `(*(type *)address).field`                one field of it
+        `*((*(type *)address).field)`             and, when `follow`, through that field's pointer
+
+    `follow` is the `parent->next` step of the typed walk, which is the same thing written the long way round.
+    """
+
+    address: str
+    type: str
+    field: str | None = None
+    follow: bool = False
+
+
+class Expanded(Permissive):
+    """One level of a typed object, with each child carrying the expression that expands *it*."""
+
+    expression: str | None = None
+    type: str | None = None
+    value: str | None = None
+    size: int | None = None
+    address: str | None = None
+    num_children: int = 0
+    children: list[dict[str, Any]] = []
+
+
+class Symbolized(Permissive):
+    """C4's one deterministic step: what an address belongs to.
+
+    Every field may be absent, and each absence carries its reason in `why` — "not in this dump" and "in a
+    mapping but not in any function" are different answers, and neither is an empty answer.
+    """
+
+    address: str
+    segment: dict[str, Any] | None = None
+    function: dict[str, Any] | None = None
+    """The enclosing function as gdb names it: `{"name": "plugin_crash", "offset": 232}` — the offset being how
+    far into that function the address is. A dict rather than a bare name because "which function" and "how far
+    into it" are two facts, and the second is what places an address in a listing. Found by the contract
+    itself: the first draft declared a string and the response model refused the answer at the source."""
+    thread: int | None = None
+    why: dict[str, str] = {}
 
 
 class DisassemblyPage(Permissive):

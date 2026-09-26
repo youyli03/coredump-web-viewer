@@ -549,7 +549,9 @@ def code_detail(
     }
 
 
-def stack_detail(transport: MiTransport, thread_num: int, levels: int | None = None) -> dict:
+def stack_detail(
+    transport: MiTransport, thread_num: int, *, offset: int = 0, limit: int | None = None
+) -> dict:
     """The stack as memory: what each frame owns, what its record says, and where the variables sit.
 
     A stack frame is a structure like any other — a range with named fields at offsets — so the same
@@ -558,10 +560,16 @@ def stack_detail(transport: MiTransport, thread_num: int, levels: int | None = N
 
     **Every** frame by default. Fetching six and leaving the rest of the live stack blank is a hole the
     reader cannot tell from "the dump has nothing there": the frames exist, so they get fetched.
+
+    `offset` and `limit` page that (requirements §5 asks for `limit`/`offset` on stacks), and the answer says
+    the *total* — a response that quietly returned three of twenty-eight frames would be the same hole in a
+    different shape.
     """
-    if levels is None:
-        levels = len(transport.backtrace(thread_num)["frames"])
-    frames = transport.stack_frames(thread_num, low=0, high=max(0, levels - 1))
+    every = transport.backtrace(thread_num)
+    total = int(every.get("total") or len(every.get("frames") or []))
+    first = max(0, offset)
+    last = total - 1 if limit is None else min(total - 1, first + max(0, limit) - 1)
+    frames = transport.stack_frames(thread_num, low=first, high=last) if last >= first else []
     slots: dict[str, list[dict]] = {}
     for frame in frames:
         try:
@@ -570,7 +578,15 @@ def stack_detail(transport: MiTransport, thread_num: int, levels: int | None = N
             # A frame with no code context (`??`) has no variables to place, and the refusal is the data.
             slots[str(frame["level"])] = []
             frame["slots_refused"] = str(exc).splitlines()[0][:200]
-    return {"thread": thread_num, "frames": frames, "slots": slots}
+    return {
+        "thread": thread_num,
+        "frames": frames,
+        "slots": slots,
+        "total": total,
+        "offset": first,
+        "limit": limit,
+        "truncated": last < total - 1,
+    }
 
 
 SAMPLES = {

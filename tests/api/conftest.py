@@ -149,6 +149,30 @@ def live_impatient(tmp_path: pathlib.Path):
 
 
 @pytest.fixture
+def stripped_bundle(tmp_path: pathlib.Path):
+    """A copy of the practice binaries with no symbols and no debug information.
+
+    The core is the real one; the executable and the plugin are stripped with the `strip` that ships beside
+    the cross gdb. Built here rather than committed, because a core and its binaries are exactly what
+    `AGENTS.md` says this repository does not keep in history — and skipping is the honest answer when the
+    toolchain is not there.
+    """
+    import shutil
+    import subprocess
+
+    strip = shutil.which("aarch64-linux-gnu-strip") or str(GDB.parent / "aarch64-linux-gnu-strip")
+    if not pathlib.Path(strip).exists() or _core_for("crash_target") is None:
+        pytest.skip("no aarch64 strip beside the cross gdb: this fixture builds a symbol-free copy")
+    out = tmp_path / "stripped"
+    out.mkdir()
+    for name in ("crash_target", "libplugin.so"):
+        target = out / name
+        shutil.copy(BUNDLE / name, target)
+        subprocess.run([strip, str(target)], check=True, capture_output=True)
+    return out
+
+
+@pytest.fixture
 def open_session():
     """`open_session(client, sample=…)` — the API's own wait, wrapped so tests cannot forget it."""
     return _open_session

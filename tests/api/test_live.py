@@ -85,7 +85,7 @@ def test_the_stack_records_are_verified_against_the_next_frame(live, open_sessio
     body = open_session(live, sample="crash_target")
     crashed = _crashed(body["summary"])
 
-    stack = live.get(f"/api/sessions/{body['id']}/stack", params={"thread": crashed["num"], "levels": 3}).json()
+    stack = live.get(f"/api/sessions/{body['id']}/stack", params={"thread": crashed["num"], "limit": 3}).json()
     assert stack["thread"] == crashed["num"]
     first = stack["frames"][0]
     record = first["record"]
@@ -229,30 +229,31 @@ def test_the_ceiling_refuses_a_read_that_is_too_large(live_tight, open_session) 
     assert allowed.status_code == 200, allowed.text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the live summary builds no typed index, so /object can only serve what the fixture pre-fetched "
-    "(docs/api.md §2.1 #4); C5 needs the expand endpoint of §6 — this test is the reminder",
-)
-def test_a_typed_object_can_be_found_by_address(live, open_session) -> None:
-    """§13.5: a pointer the viewer shows should be *resolvable* as a type.
+def test_a_typed_lookup_without_an_index_says_so_and_names_the_way_out(live, open_session) -> None:
+    """§13.5's entry point, and what happens when it has nothing to look in.
 
-    The fixture makes this look like it works, because `scripts/dump-fixture.py` pre-fetches the typed tree.
-    The live session does not (`build_summary(include_typed=False)`), and `describe()` replaces the index with
-    `{"on_demand": True}` — while nothing serves that on-demand request yet.
+    This was a strict `xfail` while the typed walk was unreachable: the summary the live session builds holds
+    **no** typed index (the index belongs to the demo profiles that pre-fetch it), and `describe()` replaced it
+    with `{"on_demand": True}` while nothing served that request — so the page could re-root a tree and never
+    walk one. P3 added `POST …/expand`, which walks one level with the *type named by the caller* (the
+    "interpret as…" picker of requirements §4), and this 404 now says which endpoint to use instead of reading
+    like a typing mistake.
     """
     body = open_session(live, sample="crash_target")
+    session = body["id"]
     crashed = _crashed(body["summary"])
     head = _arg(_frame0(body["summary"], crashed["num"]), "head")
 
-    found = live.get(f"/api/sessions/{body['id']}/object", params={"address": head})
-    assert found.status_code == 200, found.text
-    assert found.json()["type"], "the object at that address has a type"
+    reply = live.get(f"/api/sessions/{session}/object", params={"address": head})
+    assert reply.status_code == 404, reply.text
+    assert reply.json()["error"] == "not-found"
+    assert "/expand" in reply.json()["detail"], "the refusal names the endpoint that can answer"
+
+    walked = live.post(f"/api/sessions/{session}/expand", json={"address": head, "type": "struct node"})
+    assert walked.status_code == 200, walked.text
+    assert walked.json()["children"], "and that endpoint really does answer"
 
 
-# --------------------------------------------------------------------------- #
-# Lifetime, policy and honesty about the evidence
-# --------------------------------------------------------------------------- #
 def test_capacity_is_one_and_the_evicted_session_is_gone(live, open_session) -> None:
     """The policy of §6: a second core closes the first, and the first really is gone.
 

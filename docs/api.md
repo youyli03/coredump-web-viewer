@@ -63,7 +63,7 @@ and `DELETE /api/sessions`. §8 records what else has landed.
 | 1 | **there is no contract module** | `requirements.md` §8 and `architecture.md` §5 both name `src/schema.py` ("the unified data format, the frontend/backend contract"); the file does not exist. Every route returns `-> dict`, so `/openapi.json` documents almost nothing, and tests can only pin today's accidental shape |
 | 2 | **the architectural promises are unobservable** | `analysis/session.py` and `web/routes.py` contain no command counter and no result cache; only the transport caches backtraces internally (`mi.py`, "the stack, whole and cached"). `core_loads`, cache hits and command counts cannot be read from HTTP, so §1/§4/§6 cannot be asserted |
 | 3 | **the error body has two shapes** | `web/errors.py` answers `{"error", "detail"}` for transport exceptions, while `HTTPException` falls through to FastAPI's default `{"detail"}` — and an unparseable query parameter answers a third shape (FastAPI's 422 list). §13.7 asks for failures that are *clearly which of four they are*; three shapes is not that |
-| 4 | **two §13 acceptance items are unreachable** | §13.2 "clicking a frame shows its registers": the summary carries registers **only for the crashed thread** (`report.py`, `if thread["is_crashed"]`) and no endpoint serves another thread's. §13.5 (multi-level pointer expansion): `Session.describe()` replaces `typed` with `{"on_demand": True}` and there is **no `expand` endpoint**, so the live page can re-root a tree but cannot walk one level down — only the static fixture, which pre-fetches five levels, appears to work. Measured 2026-09-26, and worse than the description: `GET …/object` at a pointer the crash frame prints answers **404 `not-found`, "no type is known for…"**, and `GET …/objects` answers `[]`. The typed entry points are dead in a live session, because `build_summary` is called with `include_typed=False` so there is no index to look anything up in. `tests/api/test_live.py` pins it as a strict `xfail`, so the day it starts working the suite says so |
+| 4 | ~~two §13 acceptance items were unreachable~~ — **closed in P3** | §13.2 needed registers for any thread (the summary carried only the crashed one) and §13.5 needed a way to walk a type one level. Both are served now: `GET …/threads/{num}/registers`, and `POST …/expand` with the **type named by the caller**, which is the "interpret as…" picker of requirements §4 rather than guessed DWARF. What is still not built is an *address → type* index for a live session: `build_summary` is called with `include_typed=False`, so `GET …/object` answers 404 — and the detail now says `this session holds no typed index: name the type instead (POST /expand)` instead of reading like a typing mistake. A strict `xfail` stood here until P3, and the suite is `xfail`-free now |
 | 5 | **the test prerequisites are absent** | `TestClient` needs an HTTP client; it is in neither the venv nor `requirements.txt` (whose only test dependency is `pytest`), and it has to be `httpx2` rather than `httpx` — starlette 1.7 imports `httpx2` and only falls back to `httpx` with a deprecation warning. There was no `tests/api/` and no HTTP test anywhere in the repository |
 | 6 | **nothing is controllable** | `CONFIG` is a module singleton read while it is imported (`main.py` already documents that trap for `--gdb`), `create_app()` takes no arguments, and each route resolves the checkout root from its own `__file__`. So a test cannot shorten `command_timeout_s` to exercise the deadline path, cannot shrink `max_limit` to exercise a refusal, and cannot point the "recent" file anywhere but the checkout |
 
@@ -100,6 +100,12 @@ version; it may be imported by `web/` *and* by `analysis/` (the dependency rule 
 
 Anything not in the table answers the fallback code `http-error` with the same body, so a consumer can always
 read `error` without a completeness guarantee on our side.
+
+`501` became reachable in P3 and was not before: the typed walk is the first operation whose *capability* can
+be absent for a given dump (`POST …/expand` on a target with no DWARF), and a capability that is absent is
+stated with the note the capability itself carries — `tests/api/test_views.py` builds a symbol-free copy of the
+practice binary and asserts exactly that, next to the assertion that the same session still answers threads,
+stack, registers and memory.
 
 The four answers of §13.7 map onto `501` (no such capability), `409` (not ready yet), `502` (gdb died),
 `504` (timeout) — and a test asserts all four, because the v1 prototype's worst failure was answering
@@ -196,13 +202,15 @@ repository's rule everywhere else, and a test surface that can lie is worse than
 
 ## 6. Endpoints this adds (L4)
 
-| new or changed | serves |
+All four **landed**, plus the capability endpoint of §3. Measured on the practice core:
+
+| endpoint | what it answers (measured) |
 |---|---|
-| `GET /api/sessions/{id}/threads/{num}/registers` | §13.2 — a frame's registers for *any* thread, not only the crashed one |
-| `GET /api/sessions/{id}/stack?thread&limit&offset` and `total` / `truncated` in the answer | requirements §5: `limit`/`offset` for stacks. Today only `levels` exists and the answer never says how many frames were left out |
-| `POST /api/sessions/{id}/expand {address, path}` | §13.5 — the typed walk, one level per click, with cycle detection and the depth cap; the fixture has pretended to do this since it pre-fetched everything |
-| `GET /api/sessions/{id}/symbolize?address` | C4's one deterministic step: which function, which segment, or which thread's stack contains this address |
-| `GET /api/sessions/{id}/capabilities` | §13.6 |
+| `GET …/threads/{num}/registers` | any thread's registers, cached for the session (a core is a snapshot); the crashed thread's answer is identical to the one the first screen already carried; an unknown thread is 404 |
+| `GET …/stack?thread&offset&limit` | `total=28`, `truncated`, and windowing that returns *the same frames* rather than a second interpretation; every page together is the whole stack once. The retired `levels` parameter is **refused with 400** rather than silently ignored — a dropped parameter answers a different question than the one asked |
+| `POST …/expand {address, type, field?, follow?}` | one level: `*(struct node *)0x…` → five fields, each carrying the expression that expands *it*; `follow` gives the `parent->next` step; a type or field that is not shaped like one is 400, because the API composes the expression and never hands a caller's string to gdb |
+| `GET …/symbolize?address` | the mapping, the enclosing function with the offset into it, and — for a stack address — the thread whose stack pointer is inside that mapping. A heap address answers "no function contains this", a stack address answers with the thread, and the deliberate stray pointer answers three absences with three reasons |
+| `GET …/capabilities` | §13.6, the same bits the summary carries (asserted equal), including the note that says why something is false |
 
 Each of these is *thin by rule* (§5 of architecture: a route that computes anything has put logic in the wrong
 layer); all four are transport operations the interface already declares and `tests/gdb/` already pins.
@@ -226,7 +234,11 @@ most: **the fixture parity test** (the fixture is a second producer of the same 
 the moment either side changes), and **the read-only test** (a viewer that edits the evidence is the one
 failure nobody forgives).
 
-**Landed 2026-09-26** — L0 in full; P2's observability (the headers, both `/stats`, and the cached-replay half
+**Landed 2026-09-26** — L0 in full; the whole of L2 (every practice core through the API, each awkward case
+asserted: `smash_ra`'s two `??` frames with reasons and no variables, `smash_fp`'s named frame whose record
+contradicts the next, `smash_data`'s verifiably intact stack, `opt_target`'s register-resident variable with no
+address, `snap_target`'s `<signal handler called>`, and a stripped target that loads with `dwarf_types` false);
+P2's observability (the headers, both `/stats`, and the cached-replay half
 of L3, which is what proved the caching promise was not being kept); the contract half of L4 (the served OpenAPI is the documented surface,
 the poll's shape is declared and validated, every answer fits its model, and the two producers of the same
 JSON agree key for key); and everything in L1/L3 that needs no new endpoint: the first screen and its
@@ -243,7 +255,7 @@ mid-load close race. L2 and the rest of L3 wait on §4's observability.
 | **P0 — landed** | `httpx2` as a test dependency; `create_app(config, root, state_path, bundle)`; the uniform error body; `?wait=` and `DELETE /api/sessions`; `tests/api/` with the offline half of L0, the contract half of L4, and the parts of L1/L3 above | one: the error body gained `error` and `status` (`detail` is unchanged, so the frontend did not move), and `defaults.valid` now answers `false` for an empty suggestion instead of `true` |
 | **P1 — landed** | `src/schema.py` (the module the spec names): the models, the error vocabulary moved out of `web/errors.py`, the request body, `CONTRACT`; `response_model` on every endpoint that has a fixed shape; `GET …/capabilities`; and the parity test that builds the same summary both ways and compares their keys | additive: `/api/health` and every summary gain `contract`, and the fixture gains the same field, so a stale fixture is visible instead of merely wrong |
 | **P2 — landed** | the counters at the transport's choke point, the two `X-Gdb-*` headers, both `/stats`, and with them §13.7's four answers made distinguishable: `502 gdb-died` for a debugger that exited, `504 timeout` for one that missed a deadline, `409 not-ready` carrying the session's own words for a session that is not ready yet, and `501 unsupported` still to come in P3 | one behaviour change, and it is a fix: a session whose debugger dies now answers `502` with the reason instead of `409 "session is failed"` — the same sentence a session that is merely loading gets. Endpoints answered from the summary (`/capabilities`, `/object`, `/objects`, `/stats`, the poll) go on answering, because the death of a process does not unload a dump |
-| **P3** | the four L4 endpoints; the L2 matrix in full; the `xfail` on `/object` becomes a pass | additive, and it is what finally puts §13.2 and §13.5 within reach |
+| **P3 — landed** | the four endpoints of §6, the L2 matrix in full, and the `xfail` gone: what it described is now either served (`/expand`) or refused with a reason that names the way out (`/object`). Two §13 acceptance items that had no HTTP answer at all — registers for a non-crashed thread, and any typed walk — are reachable, and `501 unsupported` became testable for the first time | additive, except one: a target with no DWARF used to fail its **whole session**, because the summary evaluates a demo root that gdb cannot evaluate without DWARF. That dump now loads and states what it lacks |
 
 P0 and P1 come first because they change no product behaviour while making every later phase
 "write the assertion, then change the implementation" — the only order in which the tests stay honest.

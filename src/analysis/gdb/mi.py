@@ -536,6 +536,7 @@ class MiTransport(Transport):
         # (`-stack-list-variables`, `&name`, `info address`, `sizeof`, the frame record's memory read) went
         # back to gdb every time even though the backtrace and the frame locations were already cached.
         # Keyed the way the question is asked, and cleared with the rest when the session closes.
+        self._registers: dict[int, dict[str, Any]] = {}
         self._variables: dict[tuple[int, int], list[dict[str, Any]]] = {}
         self._slots: dict[tuple[int, int], list[dict[str, Any]]] = {}
         self._frame_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
@@ -1073,6 +1074,16 @@ class MiTransport(Transport):
         return cached
 
     def registers(self, thread_num: int) -> dict[str, str]:
+        """One thread's registers, cached for the session's life.
+
+        A core is a snapshot: a thread's registers cannot change while the session holds it, so this follows
+        the same rule as the backtrace and the frame rows — the second question is answered by the session. It
+        matters because more than one view asks (the registers endpoint and the stack window both do), and a
+        copy is returned rather than the cached dictionary.
+        """
+        cached = self._registers.get(thread_num)
+        if cached is not None:
+            return dict(cached)
         if self._register_names is None:
             names = self._result(self._exec("-data-list-register-names")).get("register-names") or []
             self._register_names = [str(name) for name in names]
@@ -1088,7 +1099,8 @@ class MiTransport(Transport):
                 continue
             if 0 <= index < len(self._register_names) and self._register_names[index]:
                 out[self._register_names[index]] = str(value)
-        return out
+        self._registers[thread_num] = out
+        return dict(out)
 
     def memory_map(self) -> dict:
         raise Unsupported(
@@ -1348,6 +1360,7 @@ class MiTransport(Transport):
             self._proc = None
         self._caps = None
         self._stacks.clear()
+        self._registers.clear()
         self._variables.clear()
         self._slots.clear()
         self._frame_rows.clear()
