@@ -77,7 +77,7 @@ version; it may be imported by `web/` *and* by `analysis/` (the dependency rule 
 
 | decision | why |
 |---|---|
-| every response is declared with `response_model=` | `/openapi.json` becomes a **machine-readable contract**: a test can assert that the served document matches the models, and a response that drifts is rejected where it is produced instead of in the browser |
+| every response is declared with `response_model=` | `/openapi.json` becomes a **machine-readable contract**: a test can assert that the served document matches the models, and a response that drifts is rejected where it is produced instead of in the browser. **One exception, and it is deliberate**: the session poll (`GET /api/sessions/{id}`) declares its shape in the OpenAPI document but is not re-validated at runtime — a model there would re-serialise the largest payload in the project on every poll, and the one thing it would add is the power to drop a field the model did not name, which is the failure mode this contract exists to prevent. `tests/api/test_contract.py` validates the real answers instead, which is where drift belongs |
 | `CONTRACT` (a version string) is reported by `GET /api/health` **and** carried by every summary as `session.contract` | the static fixture in `ui/data/` is produced by `scripts/dump-fixture.py`, i.e. by a *second* producer of the same JSON. A version stamped in both places turns "the fixture is stale" from a silent wrong answer into a failing test |
 | one error vocabulary, one body shape: `{"error": <code>, "detail": <message>, "status": <int>}` | §13.7's four answers become four codes; `detail` keeps the existing frontend working (`ui/app.js` reads `reply.detail`) |
 | `GET /api/sessions/{id}/capabilities` | §13.6 requires an absent capability to be *stated*. As data it can be asserted: a dump with no DWARF answers `typed: false` **and** returns 501 from the typed endpoints, rather than showing a panel that is permanently empty |
@@ -206,11 +206,12 @@ most: **the fixture parity test** (the fixture is a second producer of the same 
 the moment either side changes), and **the read-only test** (a viewer that edits the evidence is the one
 failure nobody forgives).
 
-**Landed 2026-09-26** — L0 in full, plus everything in L1/L3 that needs no new endpoint: the first screen and
-its registers, the verified stack record, a frame's own locals, the crash site's function, data stated as
-data, both memory answers, the ceiling refusal, capacity eviction, closing, the core's hash, determinism, and
-the mid-load close race. L2 and the rest of L3 wait on §4's observability; the parity half of L4 waits on
-§3's contract.
+**Landed 2026-09-26** — L0 in full; the contract half of L4 (the served OpenAPI is the documented surface,
+the poll's shape is declared and validated, every answer fits its model, and the two producers of the same
+JSON agree key for key); and everything in L1/L3 that needs no new endpoint: the first screen and its
+registers, the verified stack record, a frame's own locals, the crash site's function, data stated as data,
+both memory answers, the ceiling refusal, capacity eviction, closing, the core's hash, determinism, and the
+mid-load close race. L2 and the rest of L3 wait on §4's observability.
 
 ---
 
@@ -219,7 +220,7 @@ the mid-load close race. L2 and the rest of L3 wait on §4's observability; the 
 | phase | content | behaviour change |
 |---|---|---|
 | **P0 — landed** | `httpx2` as a test dependency; `create_app(config, root, state_path, bundle)`; the uniform error body; `?wait=` and `DELETE /api/sessions`; `tests/api/` with the offline half of L0, the contract half of L4, and the parts of L1/L3 above | one: the error body gained `error` and `status` (`detail` is unchanged, so the frontend did not move), and `defaults.valid` now answers `false` for an empty suggestion instead of `true` |
-| **P1** | `src/schema.py`, `response_model` everywhere, `CONTRACT`, `capabilities`; the fixture-parity test | none — responses gain a `contract` field |
+| **P1 — landed** | `src/schema.py` (the module the spec names): the models, the error vocabulary moved out of `web/errors.py`, the request body, `CONTRACT`; `response_model` on every endpoint that has a fixed shape; `GET …/capabilities`; and the parity test that builds the same summary both ways and compares their keys | additive: `/api/health` and every summary gain `contract`, and the fixture gains the same field, so a stale fixture is visible instead of merely wrong |
 | **P2** | `X-Gdb-*` headers and both `/stats` endpoints; the cached-replay and the rest of L3 | additive |
 | **P3** | the four L4 endpoints; the L2 matrix in full; the `xfail` on `/object` becomes a pass | additive, and it is what finally puts §13.2 and §13.5 within reach |
 

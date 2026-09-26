@@ -12,9 +12,24 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, Field
 
 from analysis.session import Session, SessionManager
+from schema import (
+    CONTRACT,
+    Capabilities,
+    CreatedSession,
+    Defaults,
+    DisassemblyPage,
+    FrameVariable,
+    Health,
+    MemoryWindow,
+    OpenSession,
+    RecentEntry,
+    Sample,
+    SessionDetail,
+    Stack,
+    TypedObject,
+)
 from web.recent import Recent
 
 router = APIRouter(prefix="/api")
@@ -24,28 +39,6 @@ WAIT_CEILING_S = 60.0
 
 A request that can block for an unbounded time is a request that can pin a worker; the ceiling is the policy,
 and a caller that wants to wait longer polls again — which is what the frontend already does."""
-
-
-class OpenSession(BaseModel):
-    """How a session is opened.
-
-    Either a `sample` name from the practice bundle — which is what the demo's chooser sends, and keeps a
-    fresh clone runnable — or explicit paths, which is what the product uses. The paths win when both are
-    given, because a caller that named a file meant that file.
-    """
-
-    sample: str | None = None
-    core: str | None = None
-    exe: str | None = None
-    gdb: str | None = None
-    sysroot: str | None = None
-    solib_search_path: str | None = None
-
-
-class SessionCreated(BaseModel):
-    id: str
-    state: str
-    elapsed: float = 0.0
 
 
 def _manager(request: Request) -> SessionManager:
@@ -82,17 +75,18 @@ def _require(request: Request, session_id: str) -> Session:
     return session
 
 
-@router.get("/health")
+@router.get("/health", response_model=Health)
 def health(request: Request) -> dict:
     return {
         "ok": True,
+        "contract": CONTRACT,
         "gdb": _config(request).gdb_path,
         "sessions": [session.describe() | {"summary": None} for session in _manager(request).all()],
     }
 
 
-@router.post("/sessions", response_model=SessionCreated, status_code=201)
-def open_session(body: OpenSession, request: Request) -> SessionCreated:
+@router.post("/sessions", response_model=CreatedSession, status_code=201)
+def open_session(body: OpenSession, request: Request) -> CreatedSession:
     bundle = _bundle(request)
 
     if body.core:
@@ -131,10 +125,10 @@ def open_session(body: OpenSession, request: Request) -> SessionCreated:
         solib_search_path=str(search) if search else None,
         opened_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
-    return SessionCreated(id=session.id, state=session.state, elapsed=session.elapsed)
+    return CreatedSession(id=session.id, state=session.state, elapsed=session.elapsed)
 
 
-@router.get("/samples")
+@router.get("/samples", response_model=list[Sample])
 def samples(request: Request) -> list[dict]:
     """The practice cores this backend can open, discovered rather than declared.
 
@@ -159,7 +153,7 @@ def samples(request: Request) -> list[dict]:
     ]
 
 
-@router.get("/defaults")
+@router.get("/defaults", response_model=Defaults)
 def defaults(request: Request) -> dict:
     """Paths that make sense *on the machine running this backend*.
 
@@ -190,7 +184,7 @@ def defaults(request: Request) -> dict:
     }
 
 
-@router.get("/recent")
+@router.get("/recent", response_model=list[RecentEntry])
 def list_recent(request: Request) -> list[dict]:
     """The cores opened before, each with its files checked *now*.
 
@@ -206,7 +200,10 @@ def forget_recent(index: int, request: Request) -> Response:
     return Response(status_code=204)
 
 
-@router.get("/sessions/{session_id}")
+@router.get(
+    "/sessions/{session_id}",
+    responses={200: {"model": SessionDetail, "description": "the poll: state, then the whole summary"}},
+)
 def read_session(session_id: str, request: Request, wait: float | None = None) -> dict:
     """The poll. `summary` is absent while loading and the whole report once it lands.
 
@@ -240,7 +237,27 @@ def close_session(session_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
-@router.get("/sessions/{session_id}/memory")
+@router.get("/sessions/{session_id}/capabilities", response_model=Capabilities)
+def capabilities(session_id: str, request: Request) -> dict:
+    """What this dump can and cannot do — §13.6, as data the page switches on instead of guessing.
+
+    It is the same section the summary carries; having it as an endpoint is what lets a caller (or a test)
+    ask the question without holding the whole first screen, and what lets the *fixture* be checked against
+    the live answer.
+    """
+    session = _require(request, session_id)
+    if session.summary is None:
+        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    info = session.summary["session"]
+    return {
+        "transport": info.get("transport"),
+        "gdb_version": info.get("gdb_version"),
+        "capabilities": info.get("capabilities") or {},
+        "notes": (info.get("capabilities") or {}).get("notes"),
+    }
+
+
+@router.get("/sessions/{session_id}/memory", response_model=MemoryWindow)
 def memory_at(session_id: str, request: Request, address: str, length: int = 256) -> dict:
     """Bytes, on demand — one window per scroll, which is the query-cost row in §5.
 
@@ -258,7 +275,7 @@ def memory_at(session_id: str, request: Request, address: str, length: int = 256
     return queries.memory_at(session.transport, address, length)
 
 
-@router.get("/sessions/{session_id}/disassemble")
+@router.get("/sessions/{session_id}/disassemble", response_model=DisassemblyPage)
 def disassemble_page(session_id: str, request: Request, address: str) -> dict:
     """The code in the page that contains `address`, one function-form request per function.
 
@@ -288,7 +305,7 @@ def disassemble_page(session_id: str, request: Request, address: str) -> dict:
     )
 
 
-@router.get("/sessions/{session_id}/object")
+@router.get("/sessions/{session_id}/object", response_model=TypedObject)
 def object_at(session_id: str, request: Request, address: str) -> dict:
     """The typed object known at an address — a lookup in the index the summary already carries."""
     session = _require(request, session_id)
@@ -302,7 +319,7 @@ def object_at(session_id: str, request: Request, address: str) -> dict:
     return found
 
 
-@router.get("/sessions/{session_id}/stack")
+@router.get("/sessions/{session_id}/stack", response_model=Stack)
 def stack(session_id: str, request: Request, thread: int | None = None, levels: int | None = None) -> dict:
     """The stack walk for one thread — the on-demand form of what the summary pre-fetches for the first screen."""
     session = _require(request, session_id)
@@ -316,7 +333,7 @@ def stack(session_id: str, request: Request, thread: int | None = None, levels: 
     return report.stack_detail(session.transport, number, levels)
 
 
-@router.get("/sessions/{session_id}/objects")
+@router.get("/sessions/{session_id}/objects", response_model=list[TypedObject])
 def objects_in(session_id: str, request: Request, address: str, length: int = 4096) -> list:
     """The typed objects overlapping a range — what the overlay on those bytes needs."""
 
@@ -331,7 +348,7 @@ def objects_in(session_id: str, request: Request, address: str, length: int = 40
     return queries.objects_in(session.summary, int(address, 16), length)
 
 
-@router.get("/sessions/{session_id}/frames/{level}")
+@router.get("/sessions/{session_id}/frames/{level}", response_model=list[FrameVariable])
 def frame_locals(session_id: str, level: int, request: Request, thread: int | None = None) -> list:
     """On demand, one frame per click — the same shape the fixture carries for every frame, asked for one.
 

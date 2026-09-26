@@ -23,19 +23,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from analysis.gdb.base import CoreNotLoaded, GdbDied, GdbError, GdbTimeout, Unreadable, Unsupported
-
-CODES: dict[int, str] = {
-    400: "bad-request",
-    404: "not-found",
-    409: "not-ready",
-    422: "invalid-parameter",
-    500: "gdb",
-    501: "unsupported",
-    502: "gdb-died",
-    504: "timeout",
-}
-"""The default machine code per status. `missing-file`, `no-core` and `unreadable` are *also* 404/409/422 and
-carry their own, more specific code — a distinction a machine consumer needs and a status code cannot carry."""
+from schema import CODES  # the vocabulary belongs to the contract, not to this module
 
 
 def body(status: int, detail: str, code: str | None = None) -> dict[str, object]:

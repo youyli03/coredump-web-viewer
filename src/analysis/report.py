@@ -26,6 +26,7 @@ if _VENDORED.is_dir():
 from analysis.gdb.base import GdbError  # noqa: E402
 from analysis.elf import memory_map  # noqa: E402
 from analysis.gdb.mi import MiTransport  # noqa: E402
+from schema import CONTRACT  # noqa: E402  (the contract is shared data; analysis/ may import it)
 
 GDB = pathlib.Path(
     os.environ.get("CDWV_GDB") or ROOT / "tmp" / "arm-toolchain" / "bin" / "aarch64-none-linux-gnu-gdb"
@@ -751,6 +752,10 @@ def build_summary(
     data = {
         "session": {
             "id": "demo",
+            # The version of the contract this summary was built to. The static fixture is the *other*
+            # producer of this same JSON, and a version stamped in both is what lets the page (and a test)
+            # notice that the file it was handed is older than the code reading it.
+            "contract": CONTRACT,
             "sample": sample,
             "core_path": str(core.relative_to(ROOT)),
             "exe_path": str((BUNDLE / sample).relative_to(ROOT)),
