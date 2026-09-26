@@ -47,6 +47,9 @@ turns one of §13's acceptance items into data.
 `DELETE /api/recent/{index}` · `POST /api/sessions` · `GET /api/sessions/{id}` · `DELETE /api/sessions/{id}` ·
 `GET /api/sessions/{id}/memory` · `…/disassemble` · `…/object` · `…/objects` · `…/stack` · `…/frames/{level}`
 
+Two endpoints in §5 and §6 are now in the tree and are **not** part of that list: `…/sessions/{id}?wait=<n>`
+and `DELETE /api/sessions`. §8 records what else has landed.
+
 | endpoint | testability today |
 |---|---|
 | `health` `samples` `defaults` `recent` | good — pure reads, no core, no gdb: they are the smoke layer |
@@ -60,8 +63,8 @@ turns one of §13's acceptance items into data.
 | 1 | **there is no contract module** | `requirements.md` §8 and `architecture.md` §5 both name `src/schema.py` ("the unified data format, the frontend/backend contract"); the file does not exist. Every route returns `-> dict`, so `/openapi.json` documents almost nothing, and tests can only pin today's accidental shape |
 | 2 | **the architectural promises are unobservable** | `analysis/session.py` and `web/routes.py` contain no command counter and no result cache; only the transport caches backtraces internally (`mi.py`, "the stack, whole and cached"). `core_loads`, cache hits and command counts cannot be read from HTTP, so §1/§4/§6 cannot be asserted |
 | 3 | **the error body has two shapes** | `web/errors.py` answers `{"error", "detail"}` for transport exceptions, while `HTTPException` falls through to FastAPI's default `{"detail"}` — and an unparseable query parameter answers a third shape (FastAPI's 422 list). §13.7 asks for failures that are *clearly which of four they are*; three shapes is not that |
-| 4 | **two §13 acceptance items are unreachable** | §13.2 "clicking a frame shows its registers": the summary carries registers **only for the crashed thread** (`report.py`, `if thread["is_crashed"]`) and no endpoint serves another thread's. §13.5 (multi-level pointer expansion): `Session.describe()` replaces `typed` with `{"on_demand": True}` and there is **no `expand` endpoint**, so the live page can re-root a tree but cannot walk one level down — only the static fixture, which pre-fetches five levels, appears to work |
-| 5 | **the test prerequisites are absent** | `TestClient` needs `httpx`; it is in neither the venv nor `requirements.txt` (whose only test dependency is `pytest`). There is no `tests/api/` and no HTTP test anywhere in the repository |
+| 4 | **two §13 acceptance items are unreachable** | §13.2 "clicking a frame shows its registers": the summary carries registers **only for the crashed thread** (`report.py`, `if thread["is_crashed"]`) and no endpoint serves another thread's. §13.5 (multi-level pointer expansion): `Session.describe()` replaces `typed` with `{"on_demand": True}` and there is **no `expand` endpoint**, so the live page can re-root a tree but cannot walk one level down — only the static fixture, which pre-fetches five levels, appears to work. Measured 2026-09-26, and worse than the description: `GET …/object` at a pointer the crash frame prints answers **404 `not-found`, "no type is known for…"**, and `GET …/objects` answers `[]`. The typed entry points are dead in a live session, because `build_summary` is called with `include_typed=False` so there is no index to look anything up in. `tests/api/test_live.py` pins it as a strict `xfail`, so the day it starts working the suite says so |
+| 5 | **the test prerequisites are absent** | `TestClient` needs an HTTP client; it is in neither the venv nor `requirements.txt` (whose only test dependency is `pytest`), and it has to be `httpx2` rather than `httpx` — starlette 1.7 imports `httpx2` and only falls back to `httpx` with a deprecation warning. There was no `tests/api/` and no HTTP test anywhere in the repository |
 | 6 | **nothing is controllable** | `CONFIG` is a module singleton read while it is imported (`main.py` already documents that trap for `--gdb`), `create_app()` takes no arguments, and each route resolves the checkout root from its own `__file__`. So a test cannot shorten `command_timeout_s` to exercise the deadline path, cannot shrink `max_limit` to exercise a refusal, and cannot point the "recent" file anywhere but the checkout |
 
 ---
@@ -85,7 +88,9 @@ version; it may be imported by `web/` *and* by `analysis/` (the dependency rule 
 |---|---|---|
 | 400 | `bad-request` | an argument was checked here and refused (for example a length above `max_limit`) |
 | 404 | `not-found` | no such core / executable / session / typed object at that address |
+| 404 | `missing-file` | an operation needed a file that is not there (a source file, a module) |
 | 409 | `not-ready` | the session is not `ready` — the state is named in `detail` |
+| 409 | `no-core` | the transport has no core loaded, which is not the same failure as a session that is loading |
 | 422 | `invalid-parameter` | the query string could not be parsed at all (FastAPI's own validation) |
 | 422 | `unreadable` | gdb could not read those bytes (a hole in the dump is data, not an error; this is a refusal) |
 | 500 | `gdb` | gdb refused the command; **its own words** are in `detail` |
@@ -93,9 +98,32 @@ version; it may be imported by `web/` *and* by `analysis/` (the dependency rule 
 | 502 | `gdb-died` | the debugger exited while the session was open |
 | 504 | `timeout` | the command deadline passed; the session is failed, never left half-answered |
 
+Anything not in the table answers the fallback code `http-error` with the same body, so a consumer can always
+read `error` without a completeness guarantee on our side.
+
 The four answers of §13.7 map onto `501` (no such capability), `409` (not ready yet), `502` (gdb died),
 `504` (timeout) — and a test asserts all four, because the v1 prototype's worst failure was answering
 `{"threads": []}` for a core that never loaded.
+
+**Two codes on one status is deliberate.** A status is what a browser or a proxy sees; the code is what the
+frontend and the tests branch on, and 409-from-a-session and 409-from-a-transport are different sentences in
+the UI. The same is true of 422: an unparseable query string is a client mistake, while `unreadable` is the
+dump itself refusing, and only one of those should ever put an error in front of a user.
+
+### 3.2 The memory refusal, measured
+
+`GET …/memory` has two honest answers and they must not be confused:
+
+* **part of the window could not be read** → `200`, with the bytes in `chunks` and the gaps in `unread`;
+* **none of it could be read** → `422 unreadable`, with a `detail` that names the address and says which of
+  the two it is. Measured on the practice core's deliberate stray pointer: *"0xdead0000dead0000 for 16 bytes
+  is not in this dump: gdb refused the command: Unable to read memory."*
+
+`requirements.md` §4 calls that second case "a normal result, not an error", and it is — the *summary* carries
+it as data (`memory.missing`), and `ui/app.js` turns the refusal into an `unread` hole rather than a failure.
+The 422 keeps "the request could not be honoured" visible to anything that is not that one caller. If it is
+ever changed to 200, the body should keep `unread` and the same reason text, so the frontend branch that
+already exists keeps working.
 
 ---
 
@@ -178,19 +206,32 @@ most: **the fixture parity test** (the fixture is a second producer of the same 
 the moment either side changes), and **the read-only test** (a viewer that edits the evidence is the one
 failure nobody forgives).
 
+**Landed 2026-09-26** — L0 in full, plus everything in L1/L3 that needs no new endpoint: the first screen and
+its registers, the verified stack record, a frame's own locals, the crash site's function, data stated as
+data, both memory answers, the ceiling refusal, capacity eviction, closing, the core's hash, determinism, and
+the mid-load close race. L2 and the rest of L3 wait on §4's observability; the parity half of L4 waits on
+§3's contract.
+
 ---
 
 ## 8. Order of work
 
 | phase | content | behaviour change |
 |---|---|---|
-| **P0** | `httpx` as a test dependency; `create_app` injection; uniform error bodies; `tests/api/` harness; the offline half of L0 and L4 | none — no endpoint changes shape except the error body, which keeps `detail` |
+| **P0 — landed** | `httpx2` as a test dependency; `create_app(config, root, state_path, bundle)`; the uniform error body; `?wait=` and `DELETE /api/sessions`; `tests/api/` with the offline half of L0, the contract half of L4, and the parts of L1/L3 above | one: the error body gained `error` and `status` (`detail` is unchanged, so the frontend did not move), and `defaults.valid` now answers `false` for an empty suggestion instead of `true` |
 | **P1** | `src/schema.py`, `response_model` everywhere, `CONTRACT`, `capabilities`; the fixture-parity test | none — responses gain a `contract` field |
-| **P2** | `X-Gdb-*` headers and both `/stats` endpoints; the cached-replay and last-command-era of L3 | additive |
-| **P3** | the four L4 endpoints; the L1/L2/L3 matrices in full | additive, and it is what finally puts §13.2 and §13.5 within reach |
+| **P2** | `X-Gdb-*` headers and both `/stats` endpoints; the cached-replay and the rest of L3 | additive |
+| **P3** | the four L4 endpoints; the L2 matrix in full; the `xfail` on `/object` becomes a pass | additive, and it is what finally puts §13.2 and §13.5 within reach |
 
 P0 and P1 come first because they change no product behaviour while making every later phase
 "write the assertion, then change the implementation" — the only order in which the tests stay honest.
+
+**P0 cost one real bug, found rather than looked for.** Running the suite made the whole test process hang for
+minutes, intermittently: `Session.load()` assigns the transport *after* `close()` has already looked, so a
+session closed — or evicted by the capacity policy — while it was still loading left its resident gdb running
+for the rest of the process, and §6's "shutdown kills every child gdb process" was quietly false for exactly
+those sessions. `tests/api/test_live.py` now closes a session mid-load and asserts the gdb is gone; with the
+fix reverted the test fails, so it is not passing by luck.
 
 ---
 
