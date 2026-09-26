@@ -703,3 +703,51 @@ def test_an_unmapped_address_says_what_gdb_said(transport: MiTransport) -> None:
     reply = transport.disassemble("0xdead0000dead0000", allow_unsymbolized=True)
     assert reply["instructions"] == []
     assert reply["reason"] and "Cannot access memory" in reply["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# What a repeated question costs
+# --------------------------------------------------------------------------- #
+def test_a_repeated_query_is_answered_by_the_session_not_gdb(transport: MiTransport) -> None:
+    """architecture.md §4: *"asking for the same thread's stack twice must not send a second command to gdb"*.
+
+    It did. Measured 2026-09-26 on the practice core, a second `/stack` cost 64 commands: the backtrace and
+    the frame locations were cached, and everything *inside* a frame was not — `-stack-list-variables`,
+    `&name`, `info address`, `sizeof`, and the memory read for each frame record all went back to gdb.
+
+    The core cannot change while a session holds it, so the same question has one answer for the life of the
+    transport, and re-asking is not freshness — it is the difference between a viewer that clicks instantly
+    and one that re-reads a gigabyte of dump per click.
+    """
+    thread = next(t["num"] for t in transport.threads() if t["is_crashed"])
+
+    first = transport.stack_frames(thread, low=0, high=2)
+    asked = transport.commands_sent
+    assert asked > 0, "the first answer has to be asked for"
+    assert transport.stack_frames(thread, low=0, high=2) == first
+    assert transport.commands_sent == asked, "a repeated range still went back to gdb"
+
+    slots = transport.frame_slots(thread, 0)
+    asked = transport.commands_sent
+    assert slots, "the crash frame has variables"
+    assert transport.frame_slots(thread, 0) == slots
+    assert transport.commands_sent == asked, "a repeated frame still went back to gdb"
+
+    variables = transport.frame_variables(thread, 1)
+    asked = transport.commands_sent
+    assert variables, "the frame under the crash has arguments"
+    assert transport.frame_variables(thread, 1) == variables
+    assert transport.commands_sent == asked, "a repeated variable list still went back to gdb"
+
+
+def test_a_cached_answer_is_a_copy(transport: MiTransport) -> None:
+    """The transport hands out copies, because callers annotate what they are given.
+
+    `report.stack_detail` marks a frame whose slots gdb refused (`slots_refused`), and with a shared list that
+    annotation would still be there on the next request — a stale field, which is the kind of wrong answer
+    this project refuses everywhere else.
+    """
+    thread = next(t["num"] for t in transport.threads() if t["is_crashed"])
+    first = transport.stack_frames(thread, low=0, high=0)
+    first[0]["slots_refused"] = "annotated by the caller"
+    assert "slots_refused" not in transport.stack_frames(thread, low=0, high=0)[0]

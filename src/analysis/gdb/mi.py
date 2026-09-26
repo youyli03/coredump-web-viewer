@@ -509,6 +509,13 @@ class MiTransport(Transport):
         self.probe_timeout_s = probe_timeout_s
         self.shutdown_grace_s = shutdown_grace_s
         self.interpreter = interpreter
+        # What this transport has cost, counted where every command passes (docs/api.md §4). Without it the
+        # promises of §1 and §4 — the core is loaded once, a repeated query sends nothing — are unobservable
+        # from outside, and a promise nobody can observe is a sentence that stops being true.
+        self.commands_sent = 0
+        self.commands_by_op: dict[str, int] = {}
+        self.timeouts = 0
+        self.errors = 0
 
         self.gdb_version: str | None = None
         self.startup_records: list[str] = []
@@ -523,6 +530,15 @@ class MiTransport(Transport):
         self._args_loaded: set[int] = set()
         """Threads whose frame arguments are already in the cached frames."""
         self._located: dict[int, dict[int, dict[str, int | None]]] = {}
+        # What a session was asked twice. `architecture.md` §4 promises that on-demand results are cached per
+        # session — "asking for the same thread's stack twice must not send a second command to gdb" — and
+        # measured 2026-09-26 it did: a repeated `/stack` cost 64 commands, because the per-frame queries
+        # (`-stack-list-variables`, `&name`, `info address`, `sizeof`, the frame record's memory read) went
+        # back to gdb every time even though the backtrace and the frame locations were already cached.
+        # Keyed the way the question is asked, and cleared with the rest when the session closes.
+        self._variables: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self._slots: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self._frame_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
         """`thread → level → {sp, fp}`, asked frame by frame because MI's frame tuple has neither."""
         self._offsets: dict[tuple[str, str], int | None] = {}
         """`(type, field) → byte offset`, asked once per session — a layout does not change."""
@@ -567,6 +583,11 @@ class MiTransport(Transport):
         the session went on advertising itself as ready — half a fix, which is why this is asked for here.
         """
         return self._proc is not None and self._proc.alive
+
+    @property
+    def pid(self) -> int | None:
+        """The gdb process, so a caller can say which one it is talking about — and a test can kill it."""
+        return self._proc.pid if self._proc is not None else None
 
     def start(self) -> "MiTransport":
         candidates = [self.interpreter] if self.interpreter else list(INTERPRETERS)
@@ -618,7 +639,19 @@ class MiTransport(Transport):
     def _exec(self, command: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         if self._proc is None:
             raise GdbError("the transport has not been started")
-        records = parse_records(self._proc.command(command, timeout=timeout))
+        # Counted before it is sent, not after it returns: a command that timed out or was refused was still
+        # sent, and hiding the ones that failed is how a cost report starts lying.
+        op = command.split(" ", 1)[0] or command
+        self.commands_sent += 1
+        self.commands_by_op[op] = self.commands_by_op.get(op, 0) + 1
+        try:
+            records = parse_records(self._proc.command(command, timeout=timeout))
+        except GdbTimeout:
+            self.timeouts += 1
+            raise
+        except GdbError:
+            self.errors += 1
+            raise
         for record in records:
             if record.get("kind") == "log":
                 # gdb's log stream is advice, not data: it is collected to be shown next to the session
@@ -818,12 +851,22 @@ class MiTransport(Transport):
         return out
 
     def frame_variables(self, thread_num: int, level: int = 0) -> list[dict]:
-        """`-stack-list-variables --simple-values` on one selected frame: arguments and locals."""
+        """`-stack-list-variables --simple-values` on one selected frame: arguments and locals.
+
+        Cached, and a copy is returned: the core does not change under a session, so the same question has the
+        same answer, and a caller annotating its own row must not be able to edit what the session keeps.
+        """
+        key = (thread_num, level)
+        cached = self._variables.get(key)
+        if cached is not None:
+            return [dict(variable) for variable in cached]
         self._select_thread(thread_num)
         if level:
             self._result(self._exec(f"-stack-select-frame {level}"))
         results = self._result(self._exec("-stack-list-variables --simple-values"))
-        return [_variable(raw) for raw in results.get("variables") or []]
+        variables = [_variable(raw) for raw in results.get("variables") or []]
+        self._variables[key] = variables
+        return [dict(variable) for variable in variables]
 
     def stack_frames(self, thread_num: int, *, low: int = 0, high: int | None = None) -> list[dict[str, Any]]:
         """Each frame's stack memory, and the frame record at its frame pointer.
@@ -837,6 +880,10 @@ class MiTransport(Transport):
             return []
         first = max(0, low)
         top = len(frames) - 1 if high is None else min(high, len(frames) - 1)
+        key = (thread_num, first, top)
+        cached = self._frame_rows.get(key)
+        if cached is not None:
+            return [dict(row) for row in cached]
         # One frame further up than asked for: a frame ends where its caller's stack begins, so the last
         # range in the slice needs the `sp` of the frame after it.
         located = self._frame_locations(thread_num, min(top + 1, len(frames) - 1))
@@ -894,7 +941,8 @@ class MiTransport(Transport):
                     "record": record,
                 }
             )
-        return out
+        self._frame_rows[key] = out
+        return [dict(row) for row in out]
 
     def frame_slots(self, thread_num: int, level: int = 0) -> list[dict[str, Any]]:
         """Arguments and locals of one frame, each with the stack bytes it occupies.
@@ -909,6 +957,10 @@ class MiTransport(Transport):
         True, False, or None when the frame's end is unknown — gdb's own location expression is the
         authority on "is it in this frame", and an address range is a second opinion.
         """
+        key = (thread_num, level)
+        cached = self._slots.get(key)
+        if cached is not None:
+            return [dict(slot) for slot in cached]
         frames = self.stack_frames(thread_num, low=level, high=level)
         if not frames:
             raise GdbError(f"thread {thread_num} has no frame {level}")
@@ -947,7 +999,8 @@ class MiTransport(Transport):
                     "inside": inside,
                 }
             )
-        return out
+        self._slots[key] = out
+        return [dict(slot) for slot in out]
 
     def _location_text(self, expression: str) -> str | None:
         """`info address` for one variable, as text.
@@ -1281,6 +1334,9 @@ class MiTransport(Transport):
             self._proc = None
         self._caps = None
         self._stacks.clear()
+        self._variables.clear()
+        self._slots.clear()
+        self._frame_rows.clear()
         self._args_loaded.clear()
         self._located.clear()
         self._offsets.clear()
