@@ -10,6 +10,7 @@ without it:
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import pytest
@@ -18,7 +19,19 @@ from analysis.gdb.base import CoreNotLoaded, GdbError, Unreadable
 from analysis.gdb.mi import MiTransport
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-GDB = ROOT / "tmp" / "arm-toolchain" / "bin" / "aarch64-none-linux-gnu-gdb.exe"
+GDB = pathlib.Path(
+    os.environ.get("CDWV_GDB") or ROOT / "tmp" / "arm-toolchain" / "bin" / "aarch64-none-linux-gnu-gdb"
+)
+"""The gdb that reads the bundle — and it has to be a *cross* gdb.
+
+The gdb that ships with the host is not enough, and that is measured rather than assumed: a native macOS
+gdb reads the core's aarch64 ELF executable and then refuses the core itself with *"Core file format not
+supported"*, and `--enable-targets=all` does not change that. So the default is the Arm-style cross name
+under the download location `AGENTS.md` sanctions (`tmp/`), and `CDWV_GDB` overrides it — the same variable
+the app reads (`src/config.py`), so a machine states *which gdb* once and both agree. `AGENTS.local.md`
+names the binary that is on this checkout. There is deliberately no `.exe` suffix: that was the Windows dev
+box's Arm toolchain, not the contract.
+"""
 BUNDLE = ROOT / "tmp" / "practice"
 
 pytestmark = pytest.mark.gdb
@@ -436,6 +449,10 @@ _STARTED: dict[str, MiTransport] = {}
 @pytest.fixture(scope="module")
 def sample():
     """A transport for one corrupted-stack sample, started on first use and closed with the module."""
+    # The same guard the rest of the module uses. Without it this fixture checked only that the *core* was
+    # there, so a bundle without a gdb did not skip — it failed with FileNotFoundError, which is the one
+    # thing this module promises never to do on a fresh clone.
+    bundle = _bundle()
 
     def open_sample(name: str) -> MiTransport:
         if name not in _STARTED:
@@ -443,7 +460,7 @@ def sample():
             if core is None:
                 pytest.skip(f"the bundle has no {name} core — run practice/collect.sh")
             transport = MiTransport(
-                gdb_path=str(GDB),
+                gdb_path=str(bundle["gdb"]),
                 core_path=str(core),
                 exe_path=str(BUNDLE / name),
                 sysroot=str(BUNDLE / "sysroot"),

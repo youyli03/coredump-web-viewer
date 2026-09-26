@@ -9,6 +9,7 @@ what `analysis/elf.py` is meant to do, so this doubles as a spike for it.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import struct
@@ -26,7 +27,12 @@ from analysis.gdb.base import GdbError  # noqa: E402
 from analysis.elf import memory_map  # noqa: E402
 from analysis.gdb.mi import MiTransport  # noqa: E402
 
-GDB = ROOT / "tmp" / "arm-toolchain" / "bin" / "aarch64-none-linux-gnu-gdb.exe"
+GDB = pathlib.Path(
+    os.environ.get("CDWV_GDB") or ROOT / "tmp" / "arm-toolchain" / "bin" / "aarch64-none-linux-gnu-gdb"
+)
+"""The cross gdb that reads these cores; `CDWV_GDB` overrides it, exactly as the app reads it, and the
+default keeps the Arm-style cross name under `tmp/` with no Windows `.exe`. See `tests/gdb` for why a
+host-native gdb will not do: it reads the executable and refuses the core."""
 BUNDLE = ROOT / "tmp" / "practice"
 EXE_NAME = "crash_target"
 """The binary being analysed: its text window is the one the demo needs, and nothing larger."""
@@ -748,7 +754,9 @@ def build_summary(
             "sample": sample,
             "core_path": str(core.relative_to(ROOT)),
             "exe_path": str((BUNDLE / sample).relative_to(ROOT)),
-            "gdb_path": GDB.name,
+            # What the session actually ran, not the module default: a caller may have named another gdb
+            # (`open_transport(gdb=…)`), and a summary that reports the wrong one is worse than none.
+            "gdb_path": pathlib.Path(transport.gdb_path).name,
             "transport": transport.name,
             "gdb_version": transport.gdb_version,
             "capabilities": caps.as_dict(),
