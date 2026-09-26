@@ -15,7 +15,7 @@ import pathlib
 
 import pytest
 
-from analysis.gdb.base import CoreNotLoaded, GdbError, Unreadable
+from analysis.gdb.base import CoreNotLoaded, GdbError, GdbTimeout, Unreadable
 from analysis.gdb.mi import MiTransport
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -60,19 +60,31 @@ def _bundle() -> dict[str, pathlib.Path]:
     return {"gdb": GDB, "core": core, "exe": exe, "sysroot": sysroot, "bundle": BUNDLE}
 
 
+def _start(**overrides) -> MiTransport:
+    """A transport on the practice core. Overrides are constructor arguments — a deadline, say.
+
+    A factory rather than one fixture, because the tests that damage a transport on purpose (a missed
+    deadline kills its gdb) must not hand the damage to the next test.
+    """
+    bundle = _bundle()
+    settings = {
+        "gdb_path": str(bundle["gdb"]),
+        "core_path": str(bundle["core"]),
+        "exe_path": str(bundle["exe"]),
+        "sysroot": str(bundle["sysroot"]),
+        "solib_search_path": str(bundle["bundle"]),
+        "command_timeout_s": 60,
+        "probe_timeout_s": 30,
+        **overrides,
+    }
+    started = MiTransport(**settings)
+    started.start()
+    return started
+
+
 @pytest.fixture(scope="module")
 def transport() -> MiTransport:
-    bundle = _bundle()
-    started = MiTransport(
-        gdb_path=str(bundle["gdb"]),
-        core_path=str(bundle["core"]),
-        exe_path=str(bundle["exe"]),
-        sysroot=str(bundle["sysroot"]),
-        solib_search_path=str(bundle["bundle"]),
-        command_timeout_s=60,
-        probe_timeout_s=30,
-    )
-    started.start()
+    started = _start()
     yield started
     started.close()
 
@@ -751,3 +763,33 @@ def test_a_cached_answer_is_a_copy(transport: MiTransport) -> None:
     first = transport.stack_frames(thread, low=0, high=0)
     first[0]["slots_refused"] = "annotated by the caller"
     assert "slots_refused" not in transport.stack_frames(thread, low=0, high=0)[0]
+
+
+def test_a_missed_deadline_kills_gdb_instead_of_answering_from_its_stream() -> None:
+    """architecture.md §6: *"on deadline, kill the gdb process and fail the session"* — and it had not been.
+
+    The transport stayed alive after a deadline, and the abandoned command's reply was still on its way: the
+    **next** command read it as its own answer. Measured before this fix — read the crashed thread's stack
+    pointer, shorten the deadline past the point where gdb can answer, then read the same address again:
+
+        before:  01000000616c7068                          (the bytes, correctly)
+        after:   422 "… is not in this dump: gdb refused the command: Unable to read memory."
+
+    A wrong answer wearing the clothes of a legitimate refusal is the worst kind of wrong this project can
+    produce, and it is exactly what "there is nothing to resynchronise" in §6 is about.
+    """
+    transport = _start()
+    try:
+        thread = next(t["num"] for t in transport.threads() if t["is_crashed"])
+        sp = transport.registers(thread)["sp"]
+        assert transport.read_memory(sp, 8)["chunks"], "the crashed thread's stack is in this dump"
+
+        transport._proc.command_timeout_s = 1e-6
+        with pytest.raises(GdbTimeout):
+            transport.read_memory(sp, 8)
+
+        assert not transport.alive, "a gdb that missed a deadline must not be trusted with the next command"
+        with pytest.raises(GdbError):
+            transport.read_memory(sp, 8)
+    finally:
+        transport.close()

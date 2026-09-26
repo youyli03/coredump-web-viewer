@@ -152,7 +152,17 @@ class GdbProcess:
 
             records: list[str] = []
             while True:
-                line = self._next_line(deadline, text).rstrip("\r\n")
+                try:
+                    line = self._next_line(deadline, text).rstrip("\r\n")
+                except GdbTimeout:
+                    # §6, and not as a precaution: "on deadline, kill the gdb process and fail the session —
+                    # a hung gdb cannot be trusted, and there is nothing to resynchronise". The reply to this
+                    # command is still on its way, and the next command would read *that* as its own answer.
+                    # Measured before this: after a deadline, reading a heap address that had just answered
+                    # bytes came back as "not in this dump" — a wrong answer wearing the clothes of a
+                    # legitimate refusal, which is the worst kind of wrong this project can produce.
+                    self.abort()
+                    raise
                 if line.startswith("(gdb)"):
                     continue  # a prompt, not a record
                 records.append(line)
@@ -191,6 +201,24 @@ class GdbProcess:
                 return
 
     # --- shutdown ---------------------------------------------------------------------- #
+    def abort(self) -> None:
+        """Kill it now: no grace, no EOF dance, nothing left to resynchronise.
+
+        Only for the case where the stream is already known to be out of step — a missed deadline. The polite
+        `close()` (stdin EOF, then terminate, then kill) is for a gdb that is still answering.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
     def close(self, *, grace_s: float = 5.0) -> None:
         """Idempotent: closing an already-dead gdb is a no-op, not an error."""
         proc = self._proc
