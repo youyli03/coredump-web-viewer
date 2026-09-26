@@ -9,6 +9,7 @@ status: Active
 
 > The shape of the system and where the code goes.
 > `requirements.md` says **what** to build and why; this file says **how it is put together**.
+> `api.md` says what the HTTP layer answers, and which of these promises a test can hold it to.
 
 ---
 

@@ -10,6 +10,8 @@
   This is the only specification in the repository; read it before building anything.
 - **`docs/architecture.md`** — the architecture and code layout: layers, the resident-gdb decision,
   the module/file map, dependency direction, configuration.
+- **`docs/api.md`** — the HTTP surface: the JSON contract, the error vocabulary, the observability that turns
+  the promises into assertions, and the test matrix that follows from them.
 
 ---
 
