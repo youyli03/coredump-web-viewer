@@ -24,6 +24,8 @@ from schema import (
     Health,
     MemoryWindow,
     OpenSession,
+    ProcessStats,
+    SessionStats,
     RecentEntry,
     Sample,
     SessionDetail,
@@ -73,6 +75,42 @@ def _require(request: Request, session_id: str) -> Session:
     if session is None:
         raise HTTPException(status_code=404, detail=f"no session {session_id!r} (it may have been reclaimed)")
     return session
+
+
+def _ready(request: Request, session_id: str) -> Session:
+    """The session, or the refusal that says *which* of requirements §13.7's four it is.
+
+    Everything used to answer 409 `not-ready` with the state as its whole explanation, so a debugger that had
+    been killed, a core that never loaded and a session that is simply still loading were one sentence. The
+    distinction is the most expensive lesson in this project — the v1 prototype's `{"threads": []}` looked like
+    a successful empty answer — so the kind of failure decides the status: 502 for a gdb that died, 504 for one
+    that never answered in time, 409 for a session that is not ready *yet*, and the session's own words in
+    every case.
+    """
+    session = _require(request, session_id)
+    if session.state == "ready" and session.transport is not None:
+        return session
+    reason = session.error or ""
+    if session.state == "failed":
+        if session.failure == "died":
+            raise HTTPException(status_code=502, detail=reason or "the debugger exited")
+        if session.failure == "timeout":
+            raise HTTPException(status_code=504, detail=reason or "the debugger did not answer in time")
+    detail = f"session is {session.state}"
+    raise HTTPException(status_code=409, detail=f"{detail}: {reason}" if reason else detail)
+
+
+def _with_summary(session: Session) -> dict:
+    """The summary the session is holding, or 409 while there is none.
+
+    A failed session that never loaded has no summary and answers 409 — never an empty report, which is the v1
+    lesson. A session whose debugger *died after* loading still has one, and what it holds is still true (the
+    core cannot change), so the endpoints that read it go on answering while the ones that need the debugger
+    answer 502. That split is the honest one: the death of a process does not unload a dump.
+    """
+    if session.summary is None:
+        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    return session.summary
 
 
 @router.get("/health", response_model=Health)
@@ -237,6 +275,22 @@ def close_session(session_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
+@router.get("/sessions/{session_id}/stats", response_model=SessionStats)
+def session_stats(session_id: str, request: Request) -> dict:
+    """What this session has cost: gdb commands, cache hits, the pid, the deadline breaches.
+
+    Read-only, and part of the contract rather than a debug back door — a promise that is not in the contract
+    is a promise the next refactor is free to delete (`docs/api.md` §4).
+    """
+    return _require(request, session_id).stats()
+
+
+@router.get("/stats", response_model=ProcessStats)
+def process_stats(request: Request) -> dict:
+    """What this process has done with cores: opened, evicted, failed, still open."""
+    return _manager(request).stats()
+
+
 @router.get("/sessions/{session_id}/capabilities", response_model=Capabilities)
 def capabilities(session_id: str, request: Request) -> dict:
     """What this dump can and cannot do — §13.6, as data the page switches on instead of guessing.
@@ -246,9 +300,7 @@ def capabilities(session_id: str, request: Request) -> dict:
     the live answer.
     """
     session = _require(request, session_id)
-    if session.summary is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
-    info = session.summary["session"]
+    info = _with_summary(session)["session"]
     return {
         "transport": info.get("transport"),
         "gdb_version": info.get("gdb_version"),
@@ -264,9 +316,7 @@ def memory_at(session_id: str, request: Request, address: str, length: int = 256
     Clamped by `config.max_limit`, because the ceiling is a policy and this is the endpoint a transcript could
     ask for a gigabyte from.
     """
-    session = _require(request, session_id)
-    if session.state != "ready" or session.transport is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    session = _ready(request, session_id)
     limit = _config(request).max_limit
     if length < 1 or length > limit:
         raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
@@ -282,16 +332,15 @@ def disassemble_page(session_id: str, request: Request, address: str) -> dict:
     On demand by design: the page's functions are what a reader is looking at, and disassembling the address
     space is not something a summary should carry.
     """
-    session = _require(request, session_id)
-    if session.state != "ready" or session.summary is None or session.transport is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
     from analysis import queries
 
-    regions = session.summary["memory_map"]["regions"]
+    regions = summary["memory_map"]["regions"]
     frames = []
-    for payload in session.summary.get("detail", {}).values():
+    for payload in summary.get("detail", {}).values():
         frames.extend(payload.get("frames", []))
-    files = session.summary.setdefault("code", {}).setdefault("files", {})
+    files = summary.setdefault("code", {}).setdefault("files", {})
     return queries.code_page(
         session.transport,
         regions,
@@ -309,11 +358,10 @@ def disassemble_page(session_id: str, request: Request, address: str) -> dict:
 def object_at(session_id: str, request: Request, address: str) -> dict:
     """The typed object known at an address — a lookup in the index the summary already carries."""
     session = _require(request, session_id)
-    if session.summary is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    summary = _with_summary(session)
     from analysis import queries
 
-    found = queries.object_at(session.summary, int(address, 16))
+    found = queries.object_at(summary, int(address, 16))
     if found is None:
         raise HTTPException(status_code=404, detail=f"no type is known for {address}")
     return found
@@ -322,13 +370,12 @@ def object_at(session_id: str, request: Request, address: str) -> dict:
 @router.get("/sessions/{session_id}/stack", response_model=Stack)
 def stack(session_id: str, request: Request, thread: int | None = None, levels: int | None = None) -> dict:
     """The stack walk for one thread — the on-demand form of what the summary pre-fetches for the first screen."""
-    session = _require(request, session_id)
-    if session.state != "ready" or session.transport is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
     from analysis import report
 
     number = thread if thread is not None else next(
-        (t["num"] for t in session.summary["threads"] if t["is_crashed"]), session.summary["threads"][0]["num"]
+        (t["num"] for t in summary["threads"] if t["is_crashed"]), summary["threads"][0]["num"]
     )
     return report.stack_detail(session.transport, number, levels)
 
@@ -338,14 +385,13 @@ def objects_in(session_id: str, request: Request, address: str, length: int = 40
     """The typed objects overlapping a range — what the overlay on those bytes needs."""
 
     session = _require(request, session_id)
-    if session.summary is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
+    summary = _with_summary(session)
     limit = _config(request).max_limit
     if length < 1 or length > limit:
         raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
     from analysis import queries
 
-    return queries.objects_in(session.summary, int(address, 16), length)
+    return queries.objects_in(summary, int(address, 16), length)
 
 
 @router.get("/sessions/{session_id}/frames/{level}", response_model=list[FrameVariable])
@@ -356,10 +402,9 @@ def frame_locals(session_id: str, level: int, request: Request, thread: int | No
     summary arrives in one piece because the first screen needs all of it, and everything after that is a
     question about one address.
     """
-    session = _require(request, session_id)
-    if session.state != "ready" or session.summary is None:
-        raise HTTPException(status_code=409, detail=f"session is {session.state}")
-    frames = session.summary.get("detail", {})
+    session = _ready(request, session_id)
+    summary = _with_summary(session)
+    frames = summary.get("detail", {})
     number = thread if thread is not None else next((int(key) for key in frames), None)
     detail = frames.get(str(number), {})
     if level < 0 or level >= len(detail.get("frames", [])):

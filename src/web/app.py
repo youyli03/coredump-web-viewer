@@ -15,6 +15,8 @@ import pathlib
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from fastapi import Request
+
 from config import CONFIG, Config
 from web import errors
 from web.routes import router
@@ -66,6 +68,40 @@ def create_app(
     app.state.sessions = SessionManager(config)
     app.include_router(router)
     errors.install(app)
+
+    def session_of(path: str):
+        """The session a request is about, if it is about one: `/api/sessions/{id}[/…]`."""
+        parts = path.strip("/").split("/")
+        if len(parts) >= 3 and parts[:2] == ["api", "sessions"] and parts[2]:
+            return app.state.sessions.get(parts[2])
+        return None
+
+    @app.middleware("http")
+    async def _report_gdb_cost(request: Request, call_next):
+        """Say what the request cost, in gdb commands (`docs/api.md` §4).
+
+        `architecture.md` §1 and §4 promise that the core is loaded once and that a repeated query is answered
+        from the session rather than from gdb again. Nothing could check either, because a request that costs
+        nothing looks exactly like a request that cost ten commands. Two headers fix that: `X-Gdb-Commands`
+        is the delta this request caused, and `X-Gdb-Cached` is the shorthand for "zero".
+
+        A request that closes its session reports zero: the transport is gone by then, and the count must
+        never appear to run backwards.
+        """
+        session = session_of(request.url.path)
+        before = session.cost() if session is not None else None
+        response = await call_next(request)
+        if before is not None:
+            sent = max(0, session.cost() - before)
+            response.headers["x-gdb-commands"] = str(sent)
+            response.headers["x-gdb-cached"] = "true" if sent == 0 else "false"
+            if response.status_code < 400:
+                # Counted only for answers: a refusal is not the cache doing its job.
+                if sent == 0:
+                    session.cache_hits += 1
+                else:
+                    session.cache_misses += 1
+        return response
 
     ui = root / config.ui_dir
     if ui.is_dir():

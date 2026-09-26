@@ -138,6 +138,17 @@ def live_tight(tmp_path: pathlib.Path):
 
 
 @pytest.fixture
+def live_impatient(tmp_path: pathlib.Path):
+    """The real core and the real gdb, with a probe deadline too short for any of them to answer.
+
+    The point is a *load* that misses its deadline: the session ends up failed without ever being usable, and
+    what a caller gets afterwards has to say so rather than look like an empty dump.
+    """
+    with _live_client(tmp_path, probe_timeout_s=0.001) as client:
+        yield client
+
+
+@pytest.fixture
 def open_session():
     """`open_session(client, sample=…)` — the API's own wait, wrapped so tests cannot forget it."""
     return _open_session

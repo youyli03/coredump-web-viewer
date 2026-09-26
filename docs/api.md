@@ -144,6 +144,26 @@ bodies carry data — and rate-of-change stays a property of the request, which 
 `/stats` is read-only and side-effect free. It is part of the contract, not a debug back door: a promise that
 is not in the contract is a promise the next refactor may delete.
 
+**Landed 2026-09-26, and it paid for itself immediately.** The transport counts every command at its one
+choke point (`MiTransport._exec`: `commands_sent`, `commands_by_op`, `timeouts`, `errors`), the HTTP layer
+reports the per-request delta in two headers, and the two `/stats` endpoints carry what a session and the
+process cost. The first thing the counters measured was that a promise was not kept: *a repeated `/stack` cost
+64 commands*, with the frame locations and the backtrace cached but every per-frame question — the variable
+list, `&name`, `info address`, `sizeof`, the frame record's memory read — going back to gdb. Cached the way
+they are asked, the same request now costs **0**, and `tests/api/test_cost.py` asserts it.
+
+One answer per request, measured after the change:
+
+| request | `X-Gdb-Commands` | `X-Gdb-Cached` |
+|---|---|---|
+| `/stack` (first) | 84 | false |
+| `/stack` (again, same thread) | **0** | true |
+| the poll of a ready session | **0** | true |
+| `/memory` (64 bytes at a heap address) | 1 | false |
+
+`/memory` is deliberately not cached: one command per window is cheap, an unbounded window cache in a tool
+that reads a gigabyte of dump is a leak, and the header says so instead of the reader having to guess.
+
 ---
 
 ## 5. Controllability (L3)
@@ -206,7 +226,8 @@ most: **the fixture parity test** (the fixture is a second producer of the same 
 the moment either side changes), and **the read-only test** (a viewer that edits the evidence is the one
 failure nobody forgives).
 
-**Landed 2026-09-26** — L0 in full; the contract half of L4 (the served OpenAPI is the documented surface,
+**Landed 2026-09-26** — L0 in full; P2's observability (the headers, both `/stats`, and the cached-replay half
+of L3, which is what proved the caching promise was not being kept); the contract half of L4 (the served OpenAPI is the documented surface,
 the poll's shape is declared and validated, every answer fits its model, and the two producers of the same
 JSON agree key for key); and everything in L1/L3 that needs no new endpoint: the first screen and its
 registers, the verified stack record, a frame's own locals, the crash site's function, data stated as data,
@@ -221,7 +242,7 @@ mid-load close race. L2 and the rest of L3 wait on §4's observability.
 |---|---|---|
 | **P0 — landed** | `httpx2` as a test dependency; `create_app(config, root, state_path, bundle)`; the uniform error body; `?wait=` and `DELETE /api/sessions`; `tests/api/` with the offline half of L0, the contract half of L4, and the parts of L1/L3 above | one: the error body gained `error` and `status` (`detail` is unchanged, so the frontend did not move), and `defaults.valid` now answers `false` for an empty suggestion instead of `true` |
 | **P1 — landed** | `src/schema.py` (the module the spec names): the models, the error vocabulary moved out of `web/errors.py`, the request body, `CONTRACT`; `response_model` on every endpoint that has a fixed shape; `GET …/capabilities`; and the parity test that builds the same summary both ways and compares their keys | additive: `/api/health` and every summary gain `contract`, and the fixture gains the same field, so a stale fixture is visible instead of merely wrong |
-| **P2** | `X-Gdb-*` headers and both `/stats` endpoints; the cached-replay and the rest of L3 | additive |
+| **P2 — landed** | the counters at the transport's choke point, the two `X-Gdb-*` headers, both `/stats`, and with them §13.7's four answers made distinguishable: `502 gdb-died` for a debugger that exited, `504 timeout` for one that missed a deadline, `409 not-ready` carrying the session's own words for a session that is not ready yet, and `501 unsupported` still to come in P3 | one behaviour change, and it is a fix: a session whose debugger dies now answers `502` with the reason instead of `409 "session is failed"` — the same sentence a session that is merely loading gets. Endpoints answered from the summary (`/capabilities`, `/object`, `/objects`, `/stats`, the poll) go on answering, because the death of a process does not unload a dump |
 | **P3** | the four L4 endpoints; the L2 matrix in full; the `xfail` on `/object` becomes a pass | additive, and it is what finally puts §13.2 and §13.5 within reach |
 
 P0 and P1 come first because they change no product behaviour while making every later phase

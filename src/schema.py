@@ -259,6 +259,7 @@ class SessionStats(Permissive):
 
     id: str
     state: str
+    failure: str | None = None
     core_loads: int
     commands_sent: int
     commands_by_op: dict[str, int]

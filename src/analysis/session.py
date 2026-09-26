@@ -20,7 +20,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from analysis import report
+from analysis.gdb.base import GdbTimeout
 from config import CONFIG
+from schema import CONTRACT
 
 
 @dataclass
@@ -40,11 +42,27 @@ class Session:
     solib_search_path: pathlib.Path | None = None
     state: str = "loading"  # loading | ready | failed | closed
     error: str | None = None
+    failure: str | None = None
+    """*Why* it is failed, in one word, so the HTTP layer can answer with the right one of §13.7's four:
+    `died` (the debugger exited), `timeout` (it never answered in time), `load` (anything else).
+
+    A status cannot carry this, and `state: failed` on its own is not an answer — the four used to collapse
+    into one 409, which is how a killed gdb and a core that never loaded became the same sentence."""
     summary: dict[str, Any] | None = None
     transport: Any = None
     _closed: bool = False
     """Set by `close()`, and read by `load()` — see the race it closes: a session closed while its gdb is still
     being opened must not leave that gdb running."""
+    cache_hits: int = 0
+    cache_misses: int = 0
+    """Requests this session answered without asking gdb, and requests that had to ask.
+
+    Counted by the HTTP layer (it is the layer that knows a *request* happened), and read through
+    `/stats`, because "on-demand results are cached per session" (architecture.md §4) is otherwise a
+    sentence with nothing behind it."""
+    on_failure: Any = None
+    """Called when a load fails, so the process can report how many did. A callback rather than the manager
+    reaching in, because a session does not know what is keeping track of it."""
     config: Any = None
     """The configuration this session was opened under, handed down by the manager rather than read from the
     module singleton: deadlines and capacity are per-process decisions, and a test that cannot shorten a
@@ -170,6 +188,9 @@ class Session:
             if not self._closed:
                 self.state = "failed"
                 self.error = f"{type(exc).__name__}: {exc}"
+                self.failure = "timeout" if isinstance(exc, GdbTimeout) else "load"
+                if self.on_failure is not None:
+                    self.on_failure()
         finally:
             self.touched = time.time()
 
@@ -182,6 +203,33 @@ class Session:
             transport.close()
         except Exception:
             pass
+
+    def cost(self) -> int:
+        """How many gdb commands this session has sent so far — the number the HTTP layer reports as a delta."""
+        return int(getattr(self.transport, "commands_sent", 0) or 0)
+
+    def stats(self) -> dict[str, Any]:
+        """What this session has cost, and whether the debugger behind it is still there.
+
+        `core_loads` is 1 once the summary exists and 0 before: the whole point of §1 is that it never becomes
+        2, and a number nobody can read is a number nobody can check.
+        """
+        transport = self.transport
+        return {
+            "id": self.id,
+            "state": self.state,
+            "failure": self.failure,
+            "core_loads": 1 if self.summary is not None else 0,
+            "commands_sent": self.cost(),
+            "commands_by_op": dict(getattr(transport, "commands_by_op", None) or {}),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "timeouts": int(getattr(transport, "timeouts", 0) or 0),
+            "errors": int(getattr(transport, "errors", 0) or 0),
+            "gdb_pid": getattr(transport, "pid", None),
+            "gdb_alive": (bool(transport.alive) if transport is not None else None),
+            "idle_s": round(time.time() - self.touched, 1),
+        }
 
     def close(self) -> None:
         self._closed = True
@@ -204,6 +252,11 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
         self._counter = 0
+        # What this process has done with cores, so the capacity policy (§6) and a failed load are visible
+        # from outside rather than inferable from a 404.
+        self.sessions_created = 0
+        self.capacity_evictions = 0
+        self.sessions_failed = 0
 
     def create(
         self,
@@ -224,7 +277,9 @@ class SessionManager:
                     break
                 old.close()
                 self._sessions.pop(old.id, None)
+                self.capacity_evictions += 1
             self._counter += 1
+            self.sessions_created += 1
             session = Session(
                 id=f"s{self._counter}",
                 core=core,
@@ -232,11 +287,25 @@ class SessionManager:
                 gdb=gdb or pathlib.Path(self.config.gdb_path),
                 sysroot=sysroot,
                 solib_search_path=solib_search_path,
+                on_failure=self._note_failure,
                 config=self.config,
             )
             self._sessions[session.id] = session
         threading.Thread(target=session.load, name=f"load-{session.id}", daemon=True).start()
         return session
+
+    def _note_failure(self) -> None:
+        self.sessions_failed += 1
+
+    def stats(self) -> dict[str, Any]:
+        """The process-level half of `docs/api.md` §4: how many sessions were opened, evicted and failed."""
+        return {
+            "contract": CONTRACT,
+            "sessions_created": self.sessions_created,
+            "capacity_evictions": self.capacity_evictions,
+            "sessions_failed": self.sessions_failed,
+            "sessions_open": len(self.all()),
+        }
 
     def get(self, session_id: str) -> Session | None:
         with self._lock:
@@ -263,6 +332,7 @@ class SessionManager:
             return
         session._release()
         session.state = "failed"
+        session.failure = "died"
         session.error = "gdb exited while the session was open — reload to start a new one"
 
     def all(self) -> list[Session]:
