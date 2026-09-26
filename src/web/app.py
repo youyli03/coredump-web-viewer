@@ -8,13 +8,14 @@ and the lesson moves here: the type is set before the mount is created.
 
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 import pathlib
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from config import CONFIG
+from config import CONFIG, Config
 from web import errors
 from web.routes import router
 
@@ -27,15 +28,46 @@ mimetypes.add_type("image/svg+xml", ".svg")
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def create_app() -> FastAPI:
+def create_app(
+    config: Config | None = None,
+    *,
+    root: pathlib.Path | None = None,
+    state_path: pathlib.Path | None = None,
+    bundle: pathlib.Path | None = None,
+) -> FastAPI:
+    """Build the app from what it is *given*, not from where this file happens to live.
+
+    Every path used to be derived from this module's own `__file__` and every tunable read from the `CONFIG`
+    singleton, which is filled while it is imported — so a test could not point the "recent" file at a
+    temporary directory, could not open a core that lives somewhere else, and could not shorten a deadline to
+    exercise the deadline path. `docs/api.md` §5 is the reasoning; the arguments are the whole of it.
+
+    The defaults reproduce the running service exactly: no argument means the repository root, its
+    `tmp/practice` bundle, the recent file next to the checkout, and the configuration from the environment.
+    """
     from analysis.session import SessionManager
 
-    app = FastAPI(title="coredump-web-viewer", version="0.1.0")
-    app.state.sessions = SessionManager()
+    config = config or CONFIG
+    root = pathlib.Path(root) if root is not None else ROOT
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI):
+        """Shutdown kills every child gdb (§6), and it is a lifespan handler rather than `@app.on_event`
+        because that decorator is deprecated in this FastAPI and this promise is the one thing on the way out
+        that must not quietly stop running."""
+        yield
+        app.state.sessions.shutdown()
+
+    app = FastAPI(title="coredump-web-viewer", version="0.1.0", lifespan=lifespan)
+    app.state.config = config
+    app.state.root = root
+    app.state.bundle = pathlib.Path(bundle) if bundle is not None else root / "tmp" / "practice"
+    app.state.state_path = pathlib.Path(state_path) if state_path is not None else root
+    app.state.sessions = SessionManager(config)
     app.include_router(router)
     errors.install(app)
 
-    ui = ROOT / CONFIG.ui_dir
+    ui = root / config.ui_dir
     if ui.is_dir():
         # The UI is edited while it is being looked at, so it must not be cached. Measured: FastAPI's
         # StaticFiles sends `ETag` and `Last-Modified` but **no** `Cache-Control`, and a browser then applies
@@ -71,10 +103,6 @@ def create_app() -> FastAPI:
         # `html=True` so `/` serves index.html; the API lives under /api and is registered first, so a static
         # file can never shadow a route.
         app.mount("/", StaticFiles(directory=str(ui), html=True), name="ui")
-
-    @app.on_event("shutdown")
-    def _shutdown() -> None:
-        app.state.sessions.shutdown()
 
     return app
 

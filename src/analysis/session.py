@@ -42,9 +42,19 @@ class Session:
     error: str | None = None
     summary: dict[str, Any] | None = None
     transport: Any = None
+    _closed: bool = False
+    """Set by `close()`, and read by `load()` — see the race it closes: a session closed while its gdb is still
+    being opened must not leave that gdb running."""
+    config: Any = None
+    """The configuration this session was opened under, handed down by the manager rather than read from the
+    module singleton: deadlines and capacity are per-process decisions, and a test that cannot shorten a
+    deadline cannot exercise the deadline path (`docs/api.md` §5)."""
     created: float = field(default_factory=time.time)
     touched: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def settings(self) -> Any:
+        return self.config or CONFIG
 
     @property
     def elapsed(self) -> float:
@@ -108,9 +118,17 @@ class Session:
 
     def load(self) -> None:
         """Open the transport and build the report. Runs in a worker thread; failures are recorded, never
-        raised into the void. The transport stays open afterwards — every later query uses this one."""
+        raised into the void. The transport stays open afterwards — every later query uses this one.
+
+        **A session closed while it is loading closes its own gdb.** `create` evicts the previous session and
+        `DELETE /api/sessions/{id}` exists, so "closed" and "still loading" really do happen at once: the load
+        thread used to assign the fresh transport *after* `close()` had already looked, and the resident gdb
+        nobody would ever query again stayed alive — which turned "shutdown kills every child gdb" (§6) into a
+        sentence that was only true for the sessions that finished loading first. Found by the HTTP suite
+        hammering the lifetime path; `tests/api/test_live.py` pins it.
+        """
         try:
-            self.transport = report.open_transport(
+            transport = report.open_transport(
                 self.core,
                 self.exe,
                 gdb=self.gdb,
@@ -118,9 +136,13 @@ class Session:
                 bundle=self.solib_search_path,
                 # The deadlines are configuration (§7), not the transport's own defaults: a setting nobody
                 # reads is a sentence that is not true.
-                command_timeout_s=CONFIG.command_timeout_s,
-                probe_timeout_s=CONFIG.probe_timeout_s,
+                command_timeout_s=self.settings().command_timeout_s,
+                probe_timeout_s=self.settings().probe_timeout_s,
             )
+            self.transport = transport
+            if self._closed:
+                self._release()
+                return
             # No disassembly or window bytes here: both are the bulk of the report and both have an endpoint
             # for the window being looked at. The session keeps the transport, so those requests reuse the core
             # that is already loaded.
@@ -133,14 +155,21 @@ class Session:
                 sample=self.core.name.split(".")[0] or "crash_target",
                 core=self.core,
             )
+            if self._closed:
+                # Closed while the summary was being built. Checked twice because the two checks cover two
+                # different windows, and either one of them can be the one that matters.
+                self._release()
+                return
             self.state = "ready"
         except Exception as exc:  # a refusal is a result: the user must see why
             # Close the transport *first*: `close()` sets the state to "closed", and setting "failed" before it
-            # means a failed load reports "closed" with the reason erased — which is exactly what happened.
-            message = f"{type(exc).__name__}: {exc}"
+            # means a failed load reports "closed" with the reason erased — which is exactly what happened. And
+            # a session that was closed on purpose keeps saying "closed": its load failing afterwards is not a
+            # failure anybody asked about.
             self._release()
-            self.state = "failed"
-            self.error = message
+            if not self._closed:
+                self.state = "failed"
+                self.error = f"{type(exc).__name__}: {exc}"
         finally:
             self.touched = time.time()
 
@@ -155,6 +184,7 @@ class Session:
             pass
 
     def close(self) -> None:
+        self._closed = True
         self._release()
         self.state = "closed"
 
@@ -167,7 +197,10 @@ class SessionManager:
     raising the cap later is a config change rather than a rewrite.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: Any = None) -> None:
+        self.config = config or CONFIG
+        """The one place capacity, deadlines and reclaim are read from. `web.app` builds the manager with the
+        configuration it was handed, so an injected config reaches every session (docs/api.md §5)."""
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
         self._counter = 0
@@ -185,7 +218,7 @@ class SessionManager:
             # Capacity is a policy (§6), and it defaults to one: opening a second core closes the first,
             # because the frontend's sample chooser is a switch, not a second window. Enforced here rather than
             # assumed, so raising `CDWV_MAX_SESSIONS` is a configuration change and nothing else.
-            keep = max(1, CONFIG.max_sessions)
+            keep = max(1, self.config.max_sessions)
             for old in list(self._sessions.values()):
                 if len(self._sessions) < keep:
                     break
@@ -196,9 +229,10 @@ class SessionManager:
                 id=f"s{self._counter}",
                 core=core,
                 exe=exe,
-                gdb=gdb or pathlib.Path(CONFIG.gdb_path),
+                gdb=gdb or pathlib.Path(self.config.gdb_path),
                 sysroot=sysroot,
                 solib_search_path=solib_search_path,
+                config=self.config,
             )
             self._sessions[session.id] = session
         threading.Thread(target=session.load, name=f"load-{session.id}", daemon=True).start()
@@ -244,13 +278,22 @@ class SessionManager:
         return True
 
     def _expired(self, session: Session) -> bool:
-        return time.time() - session.touched > CONFIG.idle_reclaim_s
+        return time.time() - session.touched > self.config.idle_reclaim_s
 
-    def shutdown(self) -> None:
-        """Kill every session. A transport that is still loading is left to its thread, which owns its own
-        process and reaps it on failure."""
+    def close_all(self) -> int:
+        """Close every session and answer how many there were.
+
+        The app's shutdown hook and `DELETE /api/sessions` kill the same children for the same reason, so they
+        are one operation with two callers rather than two implementations that drift apart.
+        """
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for session in sessions:
             session.close()
+        return len(sessions)
+
+    def shutdown(self) -> None:
+        """Kill every session on the way out. A transport that is still loading is left to its thread, which
+        owns its own process and reaps it on failure."""
+        self.close_all()

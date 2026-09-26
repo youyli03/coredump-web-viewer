@@ -8,6 +8,7 @@ logic in the wrong layer.
 from __future__ import annotations
 
 import pathlib
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -17,6 +18,12 @@ from analysis.session import Session, SessionManager
 from web.recent import Recent
 
 router = APIRouter(prefix="/api")
+
+WAIT_CEILING_S = 60.0
+"""How long `?wait=` may block, whatever the caller asks for.
+
+A request that can block for an unbounded time is a request that can pin a worker; the ceiling is the policy,
+and a caller that wants to wait longer polls again — which is what the frontend already does."""
 
 
 class OpenSession(BaseModel):
@@ -45,9 +52,27 @@ def _manager(request: Request) -> SessionManager:
     return request.app.state.sessions
 
 
-def _recent() -> Recent:
-    """The local state file, at the repository root, next to the checkout it describes."""
-    return Recent(pathlib.Path(__file__).resolve().parents[2])
+def _config(request: Request):
+    """The configuration this app was built with.
+
+    Not the `CONFIG` singleton: that is filled while `config` is imported, so anything a test wants to change
+    has to be decided before the process starts. Everything settable lives on `app.state` instead — see
+    `docs/api.md` §5 for why, and `create_app` for the defaults that reproduce the running service.
+    """
+    return request.app.state.config
+
+
+def _root(request: Request) -> pathlib.Path:
+    return request.app.state.root
+
+
+def _bundle(request: Request) -> pathlib.Path:
+    return request.app.state.bundle
+
+
+def _recent(request: Request) -> Recent:
+    """The local state file. Beside the checkout by default, wherever the app was pointed otherwise."""
+    return Recent(request.app.state.state_path)
 
 
 def _require(request: Request, session_id: str) -> Session:
@@ -59,21 +84,16 @@ def _require(request: Request, session_id: str) -> Session:
 
 @router.get("/health")
 def health(request: Request) -> dict:
-    from config import CONFIG
-
     return {
         "ok": True,
-        "gdb": CONFIG.gdb_path,
+        "gdb": _config(request).gdb_path,
         "sessions": [session.describe() | {"summary": None} for session in _manager(request).all()],
     }
 
 
 @router.post("/sessions", response_model=SessionCreated, status_code=201)
 def open_session(body: OpenSession, request: Request) -> SessionCreated:
-    from config import CONFIG
-
-    root = pathlib.Path(__file__).resolve().parents[2]
-    bundle = root / "tmp" / "practice"
+    bundle = _bundle(request)
 
     if body.core:
         core = pathlib.Path(body.core)
@@ -82,7 +102,7 @@ def open_session(body: OpenSession, request: Request) -> SessionCreated:
         exe = pathlib.Path(body.exe) if body.exe else core
         if not exe.is_file():
             raise HTTPException(status_code=404, detail=f"no such executable: {exe}")
-        gdb = pathlib.Path(body.gdb) if body.gdb else pathlib.Path(CONFIG.gdb_path)
+        gdb = pathlib.Path(body.gdb) if body.gdb else pathlib.Path(_config(request).gdb_path)
         sysroot = pathlib.Path(body.sysroot) if body.sysroot else None
         search = pathlib.Path(body.solib_search_path) if body.solib_search_path else None
     else:
@@ -93,7 +113,7 @@ def open_session(body: OpenSession, request: Request) -> SessionCreated:
             raise HTTPException(status_code=404, detail=f"no {sample!r} core in {bundle}")
         core = cores[-1]
         exe = bundle / sample
-        gdb = pathlib.Path(CONFIG.gdb_path)
+        gdb = pathlib.Path(_config(request).gdb_path)
         sysroot = bundle / "sysroot" if (bundle / "sysroot").is_dir() else None
         search = bundle
 
@@ -103,7 +123,7 @@ def open_session(body: OpenSession, request: Request) -> SessionCreated:
     # used to skip the practice samples on the grounds that they were chips in the bar — they are not any more, and
     # excluding them would leave the history describing only half of what was opened. Recorded after the session
     # exists, so an entry means something really opened.
-    _recent().record(
+    _recent(request).record(
         core=str(core),
         exe=str(exe) if exe else None,
         gdb=body.gdb if body.core else None,  # a sample uses the configured gdb, which is not the caller's choice
@@ -125,8 +145,8 @@ def samples(request: Request) -> list[dict]:
     bundle's manifest is where the build is described, and this endpoint does not claim to know more than the
     file names.
     """
-    root = pathlib.Path(__file__).resolve().parents[2]
-    bundle = root / "tmp" / "practice"
+    root = _root(request)
+    bundle = _bundle(request)
     found: dict[str, pathlib.Path] = {}
     for core in sorted(bundle.glob("*.core")):
         name = core.name.split(".")[0]
@@ -149,21 +169,23 @@ def defaults(request: Request) -> dict:
     plus the configured gdb. Each field is checked before it is offered, so a default that is not there is shown
     as missing rather than typed in as if it were real.
     """
-    from config import CONFIG
-
-    root = pathlib.Path(__file__).resolve().parents[2]
-    bundle = root / "tmp" / "practice"
+    root = _root(request)
+    bundle = _bundle(request)
     cores = sorted(bundle.glob("crash_target.*.core"))
     suggestions = {
         "core": str(cores[-1]) if cores else "",
         "exe": str(bundle / "crash_target"),
-        "gdb": str(CONFIG.gdb_path),
+        "gdb": str(_config(request).gdb_path),
         "sysroot": str(bundle / "sysroot"),
         "solib_search_path": str(bundle),
     }
     return {
         **suggestions,
-        "valid": {key: pathlib.Path(value).exists() for key, value in suggestions.items()},
+        # `bool(value)` first, and not as a flourish: `pathlib.Path("").exists()` is *true* — an empty path is
+        # `Path(".")`, and the current directory exists — so an empty suggestion used to be reported as a path
+        # that is there. The frontend compares `=== false` to decide whether to mark a field missing, so the
+        # bug made a form with nothing to offer look complete. Found by a test that fed it an empty bundle.
+        "valid": {key: bool(value) and pathlib.Path(value).exists() for key, value in suggestions.items()},
         "root": str(root),
     }
 
@@ -175,20 +197,40 @@ def list_recent(request: Request) -> list[dict]:
     Validity is measured on read rather than stored: an entry whose core was deleted is a fact about this
     filesystem, and a remembered `true` would be a claim that goes stale in silence.
     """
-    return _recent().list()
+    return _recent(request).list()
 
 
 @router.delete("/recent/{index}", status_code=204)
 def forget_recent(index: int, request: Request) -> Response:
-    _recent().forget(index)
+    _recent(request).forget(index)
     return Response(status_code=204)
 
 
 @router.get("/sessions/{session_id}")
-def read_session(session_id: str, request: Request) -> dict:
-    """The poll. `summary` is absent while loading and the whole report once it lands."""
+def read_session(session_id: str, request: Request, wait: float | None = None) -> dict:
+    """The poll. `summary` is absent while loading and the whole report once it lands.
+
+    `?wait=<seconds>` blocks until the session stops loading, capped at `WAIT_CEILING_S`. Loading is
+    asynchronous and takes seconds to minutes, so without it every caller invents its own sleep — the frontend
+    on a timer, a test in a loop. One implementation here replaces both, and nothing changes when `wait` is
+    absent.
+    """
     session = _require(request, session_id)
+    if wait and wait > 0:
+        deadline = time.monotonic() + min(float(wait), WAIT_CEILING_S)
+        while session.state == "loading" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            # Re-fetched on every turn: the session may have been reclaimed or closed while we waited, and
+            # answering with a stale object would be answering about a session that no longer exists.
+            session = _require(request, session_id)
     return session.describe()
+
+
+@router.delete("/sessions", status_code=204)
+def close_all_sessions(request: Request) -> Response:
+    """Close every session — the counterpart of the capacity policy, and how a caller cleans up."""
+    _manager(request).close_all()
+    return Response(status_code=204)
 
 
 @router.delete("/sessions/{session_id}", status_code=204)
@@ -205,13 +247,12 @@ def memory_at(session_id: str, request: Request, address: str, length: int = 256
     Clamped by `config.max_limit`, because the ceiling is a policy and this is the endpoint a transcript could
     ask for a gigabyte from.
     """
-    from config import CONFIG
-
     session = _require(request, session_id)
     if session.state != "ready" or session.transport is None:
         raise HTTPException(status_code=409, detail=f"session is {session.state}")
-    if length < 1 or length > CONFIG.max_limit:
-        raise HTTPException(status_code=400, detail=f"length must be 1..{CONFIG.max_limit}")
+    limit = _config(request).max_limit
+    if length < 1 or length > limit:
+        raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
     from analysis import queries
 
     return queries.memory_at(session.transport, address, length)
@@ -278,13 +319,13 @@ def stack(session_id: str, request: Request, thread: int | None = None, levels: 
 @router.get("/sessions/{session_id}/objects")
 def objects_in(session_id: str, request: Request, address: str, length: int = 4096) -> list:
     """The typed objects overlapping a range — what the overlay on those bytes needs."""
-    from config import CONFIG
 
     session = _require(request, session_id)
     if session.summary is None:
         raise HTTPException(status_code=409, detail=f"session is {session.state}")
-    if length < 1 or length > CONFIG.max_limit:
-        raise HTTPException(status_code=400, detail=f"length must be 1..{CONFIG.max_limit}")
+    limit = _config(request).max_limit
+    if length < 1 or length > limit:
+        raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
     from analysis import queries
 
     return queries.objects_in(session.summary, int(address, 16), length)

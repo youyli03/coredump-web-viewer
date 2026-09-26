@@ -5,6 +5,11 @@
 
 # Tests
 pytest>=8.0
+# The HTTP test client: `fastapi.testclient` is `starlette.testclient`, which is built on httpx. The API had
+# no test at all before this (docs/api.md §1), and without this line a fresh checkout cannot import the client.
+# `httpx2`, not `httpx`: starlette 1.7 imports `httpx2` and only falls back to `httpx` with a deprecation
+# warning — measured here, and the fallback path is the one that eventually disappears.
+httpx2>=2.13,<3
 
 # The API layer (`src/web/`) and the process that runs it.
 fastapi>=0.110,<1.0
