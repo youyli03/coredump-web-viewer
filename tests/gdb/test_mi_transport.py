@@ -793,3 +793,65 @@ def test_a_missed_deadline_kills_gdb_instead_of_answering_from_its_stream() -> N
             transport.read_memory(sp, 8)
     finally:
         transport.close()
+
+
+# --------------------------------------------------------------------------- #
+# A dump without DWARF
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def stripped(tmp_path_factory) -> dict:
+    """The same core, with the executable and the plugin stripped of symbols and debug information.
+
+    Built here rather than committed, because a core and its binaries are exactly what this repository does
+    not keep in history (`AGENTS.md`). The cross toolchain that provides the gdb provides `strip` too, and a
+    checkout without either skips.
+    """
+    import shutil
+    import subprocess
+
+    bundle = _bundle()
+    strip = shutil.which("aarch64-linux-gnu-strip") or str(pathlib.Path(str(bundle["gdb"])).parent / "aarch64-linux-gnu-strip")
+    if not pathlib.Path(strip).exists():
+        pytest.skip("no aarch64 strip next to the cross gdb: this test builds a symbol-free copy")
+    out = tmp_path_factory.mktemp("stripped")
+    for name in ("crash_target", "libplugin.so"):
+        target = out / name
+        shutil.copy(bundle["bundle"] / name, target)
+        subprocess.run([strip, str(target)], check=True)
+    return {"exe": out / "crash_target", "bundle": out, "core": bundle["core"], "sysroot": bundle["sysroot"]}
+
+
+def test_a_dump_without_dwarf_loads_and_says_what_it_lacks(stripped) -> None:
+    """§13.6: an absent capability is *stated*, and the rest of the dump is still readable.
+
+    Measured 2026-09-26, before this: a symbol-free target failed the **whole session**, because the summary
+    evaluates `&g_wide` for one of its windows and a refusal there propagated out of the load. A dump that can
+    still answer threads, stack, memory and disassembly showed nothing at all — the v1 prototype's mistake
+    wearing different clothes. The capability probe had the same shape of bug in the other direction:
+    `-symbol-info-types` answers `done` with an empty list when there is no DWARF, so "does gdb understand
+    this command" reported DWARF as *present* on a stripped target.
+    """
+    transport = MiTransport(
+        gdb_path=str(_bundle()["gdb"]),
+        core_path=str(stripped["core"]),
+        exe_path=str(stripped["exe"]),
+        sysroot=str(stripped["sysroot"]),
+        solib_search_path=str(stripped["bundle"]),
+        command_timeout_s=60,
+        probe_timeout_s=30,
+    )
+    transport.start()
+    try:
+        caps = transport.capabilities()
+        assert caps.dwarf_types is False, "a stripped dump has no DWARF, and the capability has to say so"
+        assert "DWARF" in (caps.notes.get("dwarf_types") or ""), "and say it in words"
+
+        # What does not need DWARF still works: the threads, the stack, the registers, the bytes.
+        threads = transport.threads()
+        assert threads, "a stripped dump still has threads"
+        crashed = next(t["num"] for t in threads if t["is_crashed"])
+        assert transport.backtrace(crashed)["frames"], "and a stack"
+        assert transport.registers(crashed)["sp"], "and registers"
+        assert transport.read_memory(transport.registers(crashed)["sp"], 16)["chunks"], "and bytes"
+    finally:
+        transport.close()

@@ -147,11 +147,21 @@ def memory_windows(
         begin, end = target
         windows.append({"name": _region_name(regions, begin), **transport.read_memory(hex(begin), end - begin)})
     # The awkward struct lives in .bss, which none of the other windows covers.
+    refused: dict[str, str] = {}
     if wide_expression:
-        wide = transport.evaluate(wide_expression)["value"]
+        try:
+            wide = transport.evaluate(wide_expression)["value"]
+        except GdbError as exc:
+            # A dump with no DWARF has no `g_wide` to evaluate, and a capability being absent is not a failure
+            # to load: §13.6 says such a dump is shown with the typed entry points disabled. Measured before
+            # this: a fully stripped binary failed the **whole session** here, so a dump that can still answer
+            # threads, stack, memory and disassembly showed nothing at all — which is the v1 prototype's
+            # mistake in a new place.
+            wide = None
+            refused["wide"] = str(exc).splitlines()[0][:200]
         if wide:
             windows.append({"name": _region_name(regions, _first_address(wide)), **transport.read_memory(wide, WIDE_WINDOW)})
-    return {"windows": windows}
+    return {"windows": windows, "refused": refused}
 
 
 SOURCE_ROOT = "/home/lyy/cdwv-practice"

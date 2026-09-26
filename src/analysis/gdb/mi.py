@@ -704,9 +704,23 @@ class MiTransport(Transport):
                 "NT_FILE note (analysis/elf.py)"
             ),
         }
-        dwarf = self._probe("-symbol-info-types --max-results 1")
-        if not dwarf:
-            notes["dwarf_types"] = "gdb did not answer -symbol-info-types (older gdb, or no DWARF loaded)"
+        # Asked as a question about *this dump*, not about the command. `-symbol-info-types` answers `done`
+        # with an empty list when there is no DWARF at all, so probing "does gdb understand this command"
+        # reported DWARF as present on a fully stripped practice target — and the viewer then offered a typed
+        # tree that cannot exist. §13.6 names exactly this case as the one that must be *stated as absent*.
+        dwarf = False
+        try:
+            answer = self._result(
+                self._exec("-symbol-info-types --max-results 1", timeout=self.probe_timeout_s)
+            )
+            # Measured shape: `symbols={debug=[{filename=…, symbols=[{name="long long"}]}]}`, and on a fully
+            # stripped target `symbols={}`. An empty answer is the dump saying it has no types.
+            debug = (answer.get("symbols") or {}).get("debug") or []
+            dwarf = any(entry.get("symbols") for entry in debug)
+            if not dwarf:
+                notes["dwarf_types"] = "this dump carries no DWARF types"
+        except GdbError as exc:
+            notes["dwarf_types"] = str(exc).splitlines()[0][:200]
 
         def asked(command: str, flag: str) -> bool:
             reason = self._probe_message(command)
