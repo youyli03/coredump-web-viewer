@@ -200,7 +200,8 @@ class SessionDetail(Permissive):
     progress: str | None = None
     error: str | None = None
     core: str
-    exe: str
+    exe: str | None = None
+    """The binary this core came from, when the caller had it. Absent is normal and says so."""
     gdb: str
     summary: Summary | None = None
 

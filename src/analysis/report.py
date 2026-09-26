@@ -186,6 +186,18 @@ def _local_source(path: str | None) -> pathlib.Path | None:
     return local if local.is_file() else None
 
 
+def _display_path(path: pathlib.Path) -> str:
+    """A path as the report should show it: relative to the checkout when it is inside it, absolute when not.
+
+    A core is not required to live in this checkout — the practice bundle does, a dump someone hands you does
+    not — and `relative_to` answers the second case with a ValueError rather than with a path.
+    """
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _executable(regions: list[dict], address: str) -> bool:
     """Whether the core's own mappings say this address is executable code.
 
@@ -608,7 +620,7 @@ DEFAULT_PROFILE = {"typed": False, "windows": False}
 
 def open_transport(
     core: pathlib.Path,
-    exe: pathlib.Path,
+    exe: pathlib.Path | None,
     *,
     gdb: pathlib.Path | None = None,
     sysroot: pathlib.Path | None = None,
@@ -618,15 +630,27 @@ def open_transport(
 ) -> MiTransport:
     """Start a resident gdb on one core, at the paths the caller names.
 
+    `exe` may be None, and that is the ordinary case for a core that arrived without its binary: gdb is then
+    told `--core` and answers about threads, registers and memory, with no symbols — which is a fact about the
+    dump to be stated (`requirements.md` §2.3), not a reason to refuse the core.
+
     Split out of `build_summary` because a session must own this: §1 chose a resident process precisely so the
     core is read once, and a function that opens and closes its own gdb per call cannot keep that promise.
     """
     transport = MiTransport(
         gdb_path=str(gdb or GDB),
         core_path=str(core),
-        exe_path=str(exe),
-        sysroot=str(sysroot) if sysroot else str(BUNDLE / "sysroot"),
-        solib_search_path=str(bundle or BUNDLE),
+        exe_path=str(exe) if exe else None,
+        # **The paths the caller named, and nothing else.** These two used to default to this checkout's
+        # practice bundle, which meant a session opened on a foreign core — a core from a real crash, with
+        # paths that exist on nobody's machine but the one that wrote it — was silently given *this* bundle as
+        # its sysroot and its shared-object search path. Measured: a core-only session reported just the frame
+        # `??` … except it did not, because gdb found the practice binaries through that very default and
+        # answered with their symbols. A fallback that manufactures a plausible answer is the one failure this
+        # project keeps refusing: the caller that wants the bundle says so (`routes.open_session` does, for a
+        # practice sample, and `build_from_paths` does below).
+        sysroot=str(sysroot) if sysroot else None,
+        solib_search_path=str(bundle) if bundle else None,
         command_timeout_s=command_timeout_s,
         probe_timeout_s=probe_timeout_s,
     )
@@ -643,9 +667,16 @@ def build_from_paths(
     sysroot: pathlib.Path | None = None,
     bundle: pathlib.Path | None = None,
 ) -> dict:
-    """Open a transport, build the report, close it — what a one-shot caller (the fixture script) wants."""
+    """Open a transport, build the report, close it — what a one-shot caller (the fixture script) wants.
+
+    The practice bundle *is* this caller's sysroot and search path, so it says so rather than relying on a
+    default: `open_transport` no longer supplies one, because a default that silently answered for a foreign
+    core was worse than no answer at all.
+    """
     core = core or sorted(BUNDLE.glob(f"{sample}.*.core"))[-1]
     exe = exe or (BUNDLE / sample)
+    sysroot = sysroot or (BUNDLE / "sysroot")
+    bundle = bundle or BUNDLE
     transport = open_transport(core, exe, gdb=gdb, sysroot=sysroot, bundle=bundle)
     try:
         return build_summary(
@@ -701,15 +732,35 @@ def build_summary(
         detail[str(thread["num"])] = payload
     crashed_num = next(t["num"] for t in threads if t["is_crashed"])
     registers = detail[str(crashed_num)]["registers"]
+    # Asked of the transport as `$sp`, which every architecture spells the same way to gdb — the register
+    # *dict* spells it differently on each one (rsp, esp, sp), and reading it here is what made a real x86-64
+    # core look unreadable.
+    stack_pointer = transport.stack_pointer(crashed_num)
+    if stack_pointer is None:
+        # The registers of the crash thread are what the first screen is built on: without `sp` there is no
+        # stack window to draw, and "no window" is not a result this report can quietly produce. Measured on a
+        # core of another architecture handed to the wrong gdb: every register came back as `<unavailable>`,
+        # gdb's own warning was *"Couldn't find general-purpose registers in core file"*, and this function
+        # died on `int('<unavailable>', 16)` — a Python traceback where gdb's account of the problem belonged.
+        # Which of gdb's lines to quote: the ones about registers if it said any, because that is the failure
+        # being reported. Measured on a real x86-64 core read by an aarch64 gdb, the first lines are complaints
+        # about mapping files it cannot open and the *account* of the problem comes later —
+        # "Couldn't find general-purpose registers in core file."
+        account = [w for w in transport.warnings if "register" in w.lower()] or transport.warnings
+        raise GdbError(
+            "gdb could not read this core's registers, so there is no stack to show"
+            + (": " + " / ".join(account[:2]) if account else "")
+            + ". A core of another architecture needs that architecture's gdb"
+        )
     # The regions come from the core's own segments and NT_FILE note, not from gdb, so they are known before
     # anything is read — which is what lets the stack window be the whole mapping rather than a guess at how
     # much of it to show.
-    regions = memory_map(core, int(registers["sp"], 16))
+    regions = memory_map(core, stack_pointer)
     stack_region = next(
         (
             (int(region["start"], 16), int(region["end"], 16))
             for region in regions
-            if int(region["start"], 16) <= int(registers["sp"], 16) < int(region["end"], 16)
+            if int(region["start"], 16) <= stack_pointer < int(region["end"], 16)
         ),
         None,
     )
@@ -749,7 +800,7 @@ def build_summary(
     memory = memory_windows(
         transport,
         regions,
-        registers["sp"],
+        hex(stack_pointer),
         head,
         crash_pc if profile["windows"] else None,
         wide_expression="&g_wide" if profile["windows"] else None,
@@ -783,8 +834,13 @@ def build_summary(
             # notice that the file it was handed is older than the code reading it.
             "contract": CONTRACT,
             "sample": sample,
-            "core_path": str(core.relative_to(ROOT)),
-            "exe_path": str((BUNDLE / sample).relative_to(ROOT)),
+            # The paths this session was actually given. They used to be forced through `relative_to(ROOT)`,
+            # and the executable through `BUNDLE / sample` — both of which are assumptions about *this* checkout
+            # holding the dump. Measured on a real core outside the checkout: `ValueError: 'tmp/cores/core…' is
+            # not in the subpath of …`, for a session that had loaded perfectly. A core from anywhere is a core;
+            # the report says where it is, relative when that is meaningful and absolute when it is not.
+            "core_path": _display_path(core),
+            "exe_path": _display_path(pathlib.Path(transport.exe_path)) if transport.exe_path else None,
             # What the session actually ran, not the module default: a caller may have named another gdb
             # (`open_transport(gdb=…)`), and a summary that reports the wrong one is worse than none.
             "gdb_path": pathlib.Path(transport.gdb_path).name,

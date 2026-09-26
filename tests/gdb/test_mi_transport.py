@@ -505,7 +505,11 @@ def test_a_smashed_return_address_leaves_gdb_with_nothing_to_follow(sample) -> N
     crashed = _crashed(transport)
     frames = transport.stack_frames(crashed, low=0, high=1)
 
-    assert transport.warnings == [], "gdb says nothing about this corruption; we are the ones who notice"
+    assert not [w for w in transport.warnings if "stack" in w.lower() or "frame" in w.lower()], (
+        "gdb says nothing about this corruption; we are the ones who notice. Scoped to the stack and the frames, "
+        "because `warnings` now also carries what gdb said while *loading* the core — this opening announces the "
+        "mapping files it cannot find, which is a different sentence about a different thing"
+    )
     # gdb's sentinel for "no symbol here" is the literal string `??`, not a missing field — the transport
     # passes it through, and rendering it as a name is the UI's decision to make.
     assert all(frame["func"] in (None, "??") for frame in frames), "no function names: the pc is not in any code"
@@ -853,5 +857,27 @@ def test_a_dump_without_dwarf_loads_and_says_what_it_lacks(stripped) -> None:
         assert transport.backtrace(crashed)["frames"], "and a stack"
         assert transport.registers(crashed)["sp"], "and registers"
         assert transport.read_memory(transport.registers(crashed)["sp"], 16)["chunks"], "and bytes"
+    finally:
+        transport.close()
+
+
+def test_startup_warnings_are_collected_and_the_banner_is_not() -> None:
+    """gdb says the important things about a core *while loading it*, on two streams that are phrased differently.
+
+    Measured — and this is why the collector reads the record marker instead of the text: the log stream carries
+    a diagnosis with no prefix at all (`&"Couldn't find general-purpose registers in core file.\\n"`), while the
+    console stream prefixes its warnings (`~"warning: …"`) and also carries the banner and `Reading symbols
+    from …`. gdb may also break a line anywhere, and did: one boundary fell immediately after `warning:`, so the
+    first version of this collected the word and threw the sentence away.
+
+    The sysroot is dropped on purpose here: without it gdb complains about the mapping files it cannot find,
+    which is a warning worth collecting and easy to produce.
+    """
+    transport = _start(sysroot=None, solib_search_path=None)
+    try:
+        assert any("file-backed mapping" in warning for warning in transport.warnings), transport.warnings
+        assert not [w for w in transport.warnings if "GNU gdb" in w or "Reading symbols" in w], (
+            "the banner and the loading line are not warnings, and collecting them would bury the ones that are"
+        )
     finally:
         transport.close()

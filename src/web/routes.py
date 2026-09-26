@@ -172,8 +172,11 @@ def open_session(body: OpenSession, request: Request) -> CreatedSession:
         core = pathlib.Path(body.core)
         if not core.is_file():
             raise HTTPException(status_code=404, detail=f"no such core: {core}")
-        exe = pathlib.Path(body.exe) if body.exe else core
-        if not exe.is_file():
+        # A core is often all there is — a dump that arrived without the build that produced it. The binary
+        # used to be faked as the core itself, which gdb answers with "not in executable format" before loading
+        # the core anyway; naming nothing is what lets the transport pass `--core` and be honest about symbols.
+        exe = pathlib.Path(body.exe) if body.exe else None
+        if exe is not None and not exe.is_file():
             raise HTTPException(status_code=404, detail=f"no such executable: {exe}")
         gdb = pathlib.Path(body.gdb) if body.gdb else pathlib.Path(_config(request).gdb_path)
         sysroot = pathlib.Path(body.sysroot) if body.sysroot else None

@@ -437,6 +437,22 @@ def _mi_quote(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _mi_unquote(text: str) -> str:
+    """The inverse: one quoted MI payload back into the text gdb printed.
+
+    A literal backslash is parked on a NUL while the escapes gdb actually uses are undone, because one pass
+    would turn an escaped backslash followed by `n` into a newline.
+    """
+    body = text
+    if body.startswith('"'):
+        body = body[1:]
+    if body.endswith('"'):
+        body = body[:-1]
+    body = body.replace("\\\\", "\x00")
+    body = body.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
+    return body.replace("\x00", "\\")
+
+
 def _field_of(variable_name: Any) -> str | None:
     """`var3.next.payload` → `payload`, when gdb sends no `exp` for a child."""
     if not isinstance(variable_name, str):
@@ -521,7 +537,14 @@ class MiTransport(Transport):
         self.startup_records: list[str] = []
         """What gdb said while starting up (banner, warnings, `=library-loaded`). Kept for diagnostics."""
         self.warnings: list[str] = []
-        """Log-stream lines gdb emitted while working. Only ever shown, never interpreted."""
+        """Log-stream lines gdb emitted while working, and the ones it emitted while *starting*.
+
+        Only ever shown, never interpreted — but they have to be complete to be worth showing, and the startup
+        lines were not: gdb says the important things about a core while it loads it. Measured on a core of
+        another architecture handed to the wrong gdb: the whole account was
+        *"warning: Couldn't find general-purpose registers in core file."* — printed during loading, kept in
+        `startup_records`, and therefore absent from the message that reported the failure.
+        """
         self._proc: GdbProcess | None = None
         self._caps: Capabilities | None = None
         self._crashed_thread: int | None = None
@@ -575,6 +598,36 @@ class MiTransport(Transport):
         return argv
 
     # --- lifecycle --------------------------------------------------------------------- #
+    def _collect_startup_warnings(self) -> None:
+        """What gdb said about this dump while it loaded it, kept in gdb's own words.
+
+        The records are **not** one message each: gdb breaks its output wherever it likes, and it does. Measured
+        on a core of another architecture handed to the wrong gdb, the stream was
+
+            &"\nwarning: "                                              ← the prefix, alone
+            &"Couldn't find general-purpose registers in core file.\n"  ← the sentence, next record
+
+        so a payload is unquoted first and the *text* is assembled second; reading record by record collects the
+        word `warning:` and throws the sentence away. Async records (`=`/`*`/`+`) are not messages and are
+        skipped, and from the console stream only the lines gdb calls a warning are kept — the console also
+        carries the banner and `Reading symbols from …`.
+        """
+        text = ""
+        for chunk in self.startup_records:
+            raw = str(chunk)
+            marker = raw[:1]
+            if marker in ("=", "*", "+"):
+                continue
+            payload = _mi_unquote(raw[1:] if marker in ("~", "&", "@") else raw)
+            if marker == "~" and not payload.lstrip().startswith("warning:"):
+                continue
+            text += payload
+
+        for line in text.splitlines():
+            line = line.strip()
+            if line and line not in self.warnings and len(self.warnings) < 100:
+                self.warnings.append(line)
+
     @property
     def alive(self) -> bool:
         """Whether the gdb this transport is talking to still exists.
@@ -601,6 +654,7 @@ class MiTransport(Transport):
                 # Everything gdb says while starting up (banner, `-ex` results, library notifications)
                 # is discarded here, so the handshake's first command cannot read a stale `^done`.
                 self.startup_records = proc.drain()
+                self._collect_startup_warnings()
                 self._handshake(interpreter)
                 self.interpreter = interpreter
                 return self
@@ -1072,6 +1126,22 @@ class MiTransport(Transport):
                 "fp": _int_literal(self._expression_text("$fp")),
             }
         return cached
+
+    def stack_pointer(self, thread_num: int) -> int | None:
+        """The stack pointer of this thread's current frame, asked as `$sp`.
+
+        `$sp` and not `registers()["sp"]`: the stack pointer has a different *name* on every architecture —
+        `rsp` on x86-64, `esp` on i386, `sp` on aarch64 and MIPS — and the report had that name written into
+        it. Measured with three real cores: an x86-64 core read by the *matching* gdb was reported as "gdb could
+        not read this core's registers", because the summary went looking for a key called `sp`. gdb's `$sp` is
+        the same question on every target it knows, which is why it is asked here instead of adding a table that
+        grows with every architecture.
+
+        None means gdb did not give one: an architecture this gdb cannot read, or a core whose registers are
+        not in it. That is an answer to report, not an exception to raise from deep inside a parser.
+        """
+        located = self._frame_locations(thread_num, 0)
+        return (located.get(0) or {}).get("sp")
 
     def registers(self, thread_num: int) -> dict[str, str]:
         """One thread's registers, cached for the session's life.

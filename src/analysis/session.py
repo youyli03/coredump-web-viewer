@@ -36,7 +36,10 @@ class Session:
 
     id: str
     core: pathlib.Path
-    exe: pathlib.Path
+    exe: pathlib.Path | None
+    """The binary the core came from, when the caller has it. `None` is a normal case — a dump that arrived
+    without its build — and it is not the same as the core itself: gdb is told `--core` and answers about
+    threads, registers and memory, with symbols absent and stated as absent."""
     gdb: pathlib.Path
     sysroot: pathlib.Path | None = None
     solib_search_path: pathlib.Path | None = None
@@ -129,7 +132,9 @@ class Session:
             "progress": self.progress,
             "error": self.error,
             "core": str(self.core),
-            "exe": str(self.exe),
+            # `None` when the core arrived without its binary, and the contract says so rather than repeating
+            # the core's path back as if a build had been found.
+            "exe": str(self.exe) if self.exe else None,
             "gdb": self.gdb.name,
             "summary": summary,
         }
@@ -261,7 +266,7 @@ class SessionManager:
     def create(
         self,
         core: pathlib.Path,
-        exe: pathlib.Path,
+        exe: pathlib.Path | None,
         *,
         gdb: pathlib.Path | None = None,
         sysroot: pathlib.Path | None = None,
