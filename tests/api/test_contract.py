@@ -34,6 +34,7 @@ DOCUMENTED_PATHS = {
     "/api/recent/{index}",
     "/api/sessions",
     "/api/sessions/{session_id}",
+    "/api/sessions/{session_id}/reload",
     "/api/stats",
     "/api/sessions/{session_id}/capabilities",
     "/api/sessions/{session_id}/stats",

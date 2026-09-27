@@ -280,6 +280,39 @@ def test_a_typed_lookup_answers_from_the_session_s_own_index(live, open_session)
     assert walked.json()["children"], "and that endpoint really does answer"
 
 
+@pytest.mark.gdb
+def test_reload_reads_the_same_core_again_in_a_new_session(live, open_session) -> None:
+    """`POST …/reload` — a core that changed under a running session, read again.
+
+    The use is a dump that was rebuilt, stripped, or replaced by a newer one while a session was open: the core
+    is read once by design (§1), so the honest way to see a new file is a *new* session with the same paths. The
+    paths come from the session, not from the caller — the summary reports a display path, and re-opening from a
+    string that was only ever meant to be read is how a viewer ends up analysing a file nobody named.
+
+    Capacity is one, so the reload evicts the session it came from: the caller ends up with exactly one session
+    on the same core, which is what a reload means here.
+    """
+    body = open_session(live, sample="crash_target")
+    before = body["id"]
+    before_core = live.get(f"/api/sessions/{before}").json()["core"]
+
+    reloaded = live.post(f"/api/sessions/{before}/reload")
+    assert reloaded.status_code == 201, reloaded.text
+    after = reloaded.json()["id"]
+    assert after != before, "a reload is a new session: the core has to be read again, not re-pointed"
+
+    fresh = live.get(f"/api/sessions/{after}", params={"wait": 60}).json()
+    assert fresh["state"] == "ready", fresh.get("error")
+    assert fresh["core"] == before_core, "the same core, not the same *string*: read from the session's own path"
+    assert fresh.get("summary"), "and it is a whole session, not a bare id"
+
+    # The one it replaced is gone — evicted by capacity, which is the point of a reload rather than a second window.
+    assert live.get(f"/api/sessions/{before}").status_code == 404
+
+    # A reload of a session that is not there is a 404, not a new session opened from nothing.
+    assert live.post("/api/sessions/nope/reload").status_code == 404
+
+
 def test_capacity_is_one_and_the_evicted_session_is_gone(live, open_session) -> None:
     """The policy of §6: a second core closes the first, and the first really is gone.
 

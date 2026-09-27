@@ -44,7 +44,7 @@ turns one of §13's acceptance items into data.
 ## 2. The surface today
 
 `GET /api/health` · `GET /api/samples` · `GET /api/defaults` · `GET /api/recent` ·
-`DELETE /api/recent/{index}` · `POST /api/sessions` · `GET /api/sessions/{id}` · `DELETE /api/sessions/{id}` ·
+`DELETE /api/recent/{index}` · `POST /api/sessions` · `GET /api/sessions/{id}` · `POST /api/sessions/{id}/reload` · `DELETE /api/sessions/{id}` ·
 `GET /api/sessions/{id}/memory` · `…/disassemble` · `…/object` · `…/objects` · `…/stack` · `…/frames/{level}`
 
 Two endpoints in §5 and §6 are now in the tree and are **not** part of that list: `…/sessions/{id}?wait=<n>`
@@ -274,6 +274,7 @@ exactly 1). The frame **locations** for a whole window are now asked for in one 
 | `POST …/expand {address, type, field?, follow?}` | one level: `*(struct node *)0x…` → five fields, each carrying the expression that expands *it*; `follow` gives the `parent->next` step; a type or field that is not shaped like one is 400, because the API composes the expression and never hands a caller's string to gdb |
 | `GET …/symbolize?address` | the mapping, the enclosing function with the offset into it, and — for a stack address — the thread whose stack pointer is inside that mapping. A heap address answers "no function contains this", a stack address answers with the thread, and the deliberate stray pointer answers three absences with three reasons |
 | `GET …/capabilities` | §13.6, the same bits the summary carries (asserted equal), including the note that says why something is false |
+| `POST …/reload` | reads the **same core again** in a new session: `201` with the new id, the new session is whole (poll it the same way), and the one it replaced is evicted by capacity — measured on the practice core, 0.9 s end to end. The paths are the *session's* own, not the caller's and not the summary's: the summary reports a display path (relative to this checkout when it can be), and re-opening from a string that was only meant to be read is how a viewer ends up analysing a file nobody named. A session that **failed** to load reloads too — that is when a reader most wants another try — so the endpoint needs `404`-able existence, not readiness |
 
 Each of these is *thin by rule* (§5 of architecture: a route that computes anything has put logic in the wrong
 layer); all four are transport operations the interface already declares and `tests/gdb/` already pins.

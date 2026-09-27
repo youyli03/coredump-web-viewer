@@ -603,7 +603,12 @@ function topbar() {
       ),
     ),
     h("span", { class: "spacer" }),
-    h("button", { text: "reload", onclick: () => toast("would re-create the session with the same paths", "warn") }),
+    h("button", {
+      text: state.reloading ? "reloading…" : "reload",
+      title: "read this core again with the same paths — for a core that changed under the session",
+      disabled: Boolean(state.reloading),
+      onclick: () => reloadSession(),
+    }),
     h("button", {
       text: "close session",
       onclick: () => {
@@ -5150,17 +5155,10 @@ async function closeLoaded(entry) {
 //
 // Opening a session there is asynchronous — a core takes seconds to minutes — so the poll *is* the progress
 // display: `elapsed` moves, and a progress line that never changes is indistinguishable from a hang.
-async function loadFromBackend(body, token) {
-  const created = await fetch("/api/sessions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    // A sample name *or* a set of paths — the endpoint takes both, and the form on the empty screen sends the
-    // paths the reader typed. Sending `{sample}` for a core nobody ships was the gap: the fields existed and
-    // the backend accepted them, but nothing ever read the inputs.
-    body: JSON.stringify(body),
-  });
-  if (!created.ok) throw new Error(`backend refused: ${created.status}`);
-  const { id } = await created.json();
+// Wait for a session that already exists. Split out of `loadFromBackend` because there is a second caller now:
+// `reloadSession` gets its session id from the reload endpoint, and posting to `/api/sessions` again would open
+// *another* core instead of waiting for that one.
+async function awaitSession(id, token) {
   // Recorded now, not when the load finishes: this is the session `Cancel` has to close, and while a 25 MB core
   // is being read is precisely when cancelling matters (§6 — capacity one, so an abandoned load would hold the
   // resident gdb).
@@ -5185,6 +5183,20 @@ async function loadFromBackend(body, token) {
     render();
   }
   throw new Error("the session never became ready");
+}
+
+async function loadFromBackend(body, token) {
+  const created = await fetch("/api/sessions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    // A sample name *or* a set of paths — the endpoint takes both, and the form on the empty screen sends the
+    // paths the reader typed. Sending `{sample}` for a core nobody ships was the gap: the fields existed and
+    // the backend accepted them, but nothing ever read the inputs.
+    body: JSON.stringify(body),
+  });
+  if (!created.ok) throw new Error(`backend refused: ${created.status}`);
+  const { id } = await created.json();
+  return awaitSession(id, token);
 }
 
 // Everything downstream of "the report is here". Both entry points end here — a core this checkout ships,
@@ -5340,6 +5352,36 @@ async function boot(which = null) {
 // the same report installation — and deliberately **no** fixture fallback. The fixture is a *different* core, so
 // showing it after a path failed would be the silent substitution this project refuses. Instead the form stays,
 // with the paths that were typed, and the reason it failed is printed on it.
+// Read the same core again. The paths are the session's own — the server holds them, and a display path
+// (`tmp/practice/…`, relative to this checkout) is not something to round-trip through the browser.
+async function reloadSession() {
+  if (!state.live || state.reloading) return;
+  state.reloading = true;
+  logEvent("reload: reading this core again");
+  render();
+  try {
+    const response = await fetch(`/api/sessions/${state.live.id}/reload`, { method: "POST" });
+    const reply = await response.json();
+    if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
+    const token = (state.loadToken = (state.loadToken ?? 0) + 1);
+    state.ui = "loading";
+    state.loading = { progress: "", seconds: 0 };
+    state.status = "re-reading the core…";
+    paintState();
+    paintLog();
+    render();
+    const live = await awaitSession(reply.id, token);
+    if (token !== state.loadToken) return;
+    state.live = { id: reply.id };
+    installReport(live.summary, { origin: `live core (reloaded) · ${leaf(String(state.sample ?? ""))}`, sample: state.sample });
+  } catch (error) {
+    if (state.loadToken) logEvent(`reload failed: ${error.message}`);
+    toast(`reload failed: ${error.message}`, "error");
+  }
+  state.reloading = false;
+  render();
+}
+
 async function bootFromPaths(fields) {
   const core = String(fields.core ?? "").trim();
   if (!core) {

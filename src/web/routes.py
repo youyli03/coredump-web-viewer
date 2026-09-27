@@ -313,6 +313,33 @@ def close_all_sessions(request: Request) -> Response:
     return Response(status_code=204)
 
 
+@router.post("/sessions/{session_id}/reload", response_model=CreatedSession, status_code=201)
+def reload_session(session_id: str, request: Request) -> CreatedSession:
+    """Read the same core again, with the paths **the session was opened with**.
+
+    The point of this is a core that changed under a running session — it was rebuilt, stripped, or replaced by a
+    newer dump — and a gdb that has to see the new file. Everything else about a session is deliberately
+    permanent (the core is read once, §1), so the honest way to see a new file is a *new* session, not a session
+    that quietly re-reads.
+
+    The paths come from the session itself rather than from the caller or from the summary: the summary reports a
+    *display* path (relative to this checkout when it can be, absolute when it cannot), and re-opening from that
+    would be a round trip through a string that was only ever meant to be read. A session that failed to load
+    reloads too — that is the case where the reader most wants another try — so this needs the session to exist,
+    not to be ready.
+    """
+    session = _require(request, session_id)
+    manager = _manager(request)
+    fresh = manager.create(
+        session.core,
+        session.exe,
+        gdb=session.gdb,
+        sysroot=session.sysroot,
+        solib_search_path=session.solib_search_path,
+    )
+    return CreatedSession(id=fresh.id, state=fresh.state, elapsed=fresh.elapsed)
+
+
 @router.delete("/sessions/{session_id}", status_code=204)
 def close_session(session_id: str, request: Request) -> Response:
     if not _manager(request).close(session_id):
