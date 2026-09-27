@@ -199,19 +199,94 @@ function windowFor(target) {
 // The fixture carries them; the backend does not, because they are most of the report's size — so a window on
 // screen asks for *the pages it is looking at* (`ensurePages`). Until the answer arrives the map is empty and
 // the pane says so: a page of zeroes would be a claim about bytes nobody has read yet.
-function byteMap(window) {
-  if (!window.chunks) return new Map();
-  if (!window.bytes) {
-    const map = new Map();
-    for (const chunk of window.chunks) {
-      const base = BigInt(chunk.address);
-      for (let i = 0; i < chunk.length; i += 1) {
-        map.set((base + BigInt(i)).toString(), parseInt(chunk.bytes.slice(i * 2, i * 2 + 2), 16));
-      }
+// `byteAt` and `bytesAt` replace the per-byte map this used to build. That map was one Map entry per byte with a
+// decimal address string as its key — measured on the heavy core's 3.8 MB stack window: **1 772 ms** and
+// hundreds of megabytes, rebuilt for every window the reader opened. The bytes are already here as hex runs, so
+// a lookup is a binary search over a handful of chunks and two characters of a string.
+function byteAt(window, address) {
+  const chunks = window?.chunks;
+  if (!chunks?.length) return undefined;
+  let low = 0;
+  let high = chunks.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const chunk = chunks[middle];
+    const begin = BigInt(chunk.address);
+    if (address < begin) {
+      high = middle - 1;
+      continue;
     }
-    window.bytes = map;
+    const offset = address - begin;
+    if (offset >= BigInt(chunk.length)) {
+      low = middle + 1;
+      continue;
+    }
+    return parseInt(chunk.bytes.slice(Number(offset) * 2, Number(offset) * 2 + 2), 16);
   }
-  return window.bytes;
+  return undefined;
+}
+
+// `count` bytes from `address`, `undefined` where the window does not hold them. One call per row rather than
+// sixteen: the binary search is the cost, not the parse.
+function bytesAt(window, address, count) {
+  const out = new Array(count);
+  let chunk = null;
+  let begin = 0n;
+  let length = 0n;
+  for (let index = 0; index < count; index += 1) {
+    const at = address + BigInt(index);
+    if (chunk === null || at < begin || at >= begin + length) {
+      chunk = chunkOf(window, at);
+      if (!chunk) {
+        out[index] = undefined;
+        continue;
+      }
+      begin = BigInt(chunk.address);
+      length = BigInt(chunk.length);
+    }
+    const offset = Number(at - begin) * 2;
+    out[index] = parseInt(chunk.bytes.slice(offset, offset + 2), 16);
+  }
+  return out;
+}
+
+// The hex run covering `[from, to)`, or null when the window does not hold all of it. One slice, so a caller
+// that only wants to know "is anything in here non-zero" does not walk the bytes.
+function hexSlice(window, from, to) {
+  const chunk = chunkOf(window, from);
+  if (!chunk) return null;
+  const begin = BigInt(chunk.address);
+  if (begin + BigInt(chunk.length) < to) return null;
+  const offset = Number(from - begin) * 2;
+  return chunk.bytes.slice(offset, offset + Number(to - from) * 2);
+}
+
+function chunkOf(window, address) {
+  const chunks = window?.chunks;
+  if (!chunks?.length) return null;
+  let low = 0;
+  let high = chunks.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const chunk = chunks[middle];
+    const begin = BigInt(chunk.address);
+    if (address < begin) high = middle - 1;
+    else if (address >= begin + BigInt(chunk.length)) low = middle + 1;
+    else return chunk;
+  }
+  return null;
+}
+
+// A whole range present **and** zero: the fold question, asked of a page at a time. A page the dump does not
+// carry is not zero — it is missing — and the two must not fold into the same picture, so this looks for one
+// chunk that covers the whole range and reads its hex run.
+function rangeIsZero(window, from, to) {
+  const chunk = chunkOf(window, from);
+  if (!chunk) return false;
+  const begin = BigInt(chunk.address);
+  if (begin + BigInt(chunk.length) < to) return false;
+  const offset = Number(from - begin) * 2;
+  return !/[^0]/.test(chunk.bytes.slice(offset, offset + Number(to - from) * 2));
 }
 
 // What gdb already knows about an address, and the children it handed us for it.
@@ -1494,23 +1569,46 @@ function resolveSelection(address) {
 // Nesting needs one more rule here: where a smaller object covers the same bytes, the bigger one's piece is
 // **dropped**, not drawn underneath. Two labels placed on the same cells is not "deeper detail", it is
 // `{0d{s=[3]}▸×3` — the text of both printed on top of each other.
-function rowPieces(objects, row) {
-  const rowStart = row;
-  const rowEnd = row + 16n;
+// What is the same for every row, computed **once per window** instead of once per row.
+//
+// `layoutPieces` walks an object's fields and the "shaded" question compares an object against every smaller
+// object it contains — both are about objects, not about the sixteen bytes of one row, and both used to be
+// redone for each of the rows on screen. Measured on the heavy core's stack window, where a deep stack brings
+// ~5 000 objects into the overlay: 5 000 piece layouts and a 5 000² nested scan per row. Hoisting it is the
+// difference between a pane that opens and a pane that hangs.
+function pieceLayout(objects) {
   const laid = objects.map((object) => ({ object, pieces: layoutPieces(object) }));
-  const shaded = (entry, from, to) =>
-    laid.some(
-      (other) =>
-        other.object !== entry.object &&
-        other.object.size < entry.object.size &&
-        contains(entry.object, other.object) &&
-        other.pieces.some((piece) => piece.start < to && from < piece.end),
-    );
-
-  // Two objects can describe the same bytes of this row — a struct and a union member, or (as in a frame whose field
-  // offsets came out negative, see `layoutPieces`) one that was placed wrongly. Overlapping cells share a grid track
-  // and their labels print on top of each other, which is what "saved x290x7fc1" was. So the row's pieces are
-  // arbitrated: the more specific object claims first, and whatever it does not cover stays with the other.
+  // For each object, every *smaller contained* object's pieces — the ranges that drop its own pieces. Built
+  // once, per object, from the containment relation that does not depend on the row either.
+  const covering = new Map();
+  // A smaller object that a piece of ours is dropped for has to *start inside us* — so the candidates for an
+  // object are the objects beginning in its own range, found by binary search over the starts, not every object
+  // in the window. That is what keeps this out of the O(objects²) class the per-row version lived in.
+  const byStart = laid
+    .map((entry) => ({ entry, start: entry.object.start ?? objectAddress(entry.object) }))
+    .filter((item) => item.start !== null)
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  for (const { entry, start } of byStart) {
+    const end = start + BigInt(entry.object.size ?? 0);
+    const size = Number(entry.object.size ?? 0);
+    const ranges = [];
+    // The first index whose start is >= ours, then everything that starts before our end.
+    let low = 0;
+    let high = byStart.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (byStart[middle].start < start) low = middle + 1;
+      else high = middle;
+    }
+    for (let index = low; index < byStart.length && byStart[index].start < end; index += 1) {
+      const other = byStart[index];
+      if (other.entry.object === entry.object) continue;
+      if (!(Number(other.entry.object.size ?? 0) < size)) continue;
+      if (!contains(entry.object, other.entry.object)) continue;
+      for (const piece of other.entry.pieces) ranges.push([piece.start, piece.end]);
+    }
+    covering.set(entry.object, ranges);
+  }
   const order = laid.slice().sort((a, b) => {
     const sizeA = Number(a.object.size ?? 0);
     const sizeB = Number(b.object.size ?? 0);
@@ -1519,6 +1617,35 @@ function rowPieces(objects, row) {
     const startB = b.object.start ?? objectAddress(b.object) ?? 0n;
     return startA < startB ? -1 : startA > startB ? 1 : 0;
   });
+  return { laid, covering, order };
+}
+
+// One cache per *window build*: the objects array is built once per render and handed to every row of that
+// render, so a WeakMap keyed on it is a cache for exactly as long as the layout it describes is valid.
+const pieceLayouts = new WeakMap();
+
+function layerFor(objects) {
+  let layer = pieceLayouts.get(objects);
+  if (!layer) {
+    layer = pieceLayout(objects);
+    pieceLayouts.set(objects, layer);
+  }
+  return layer;
+}
+
+function rowPieces(objects, row) {
+  const rowStart = row;
+  const rowEnd = row + 16n;
+  const layer = layerFor(objects);
+  const { laid, covering, order } = layer;
+  const shaded = (entry, from, to) =>
+    (covering.get(entry.object) ?? []).some(([start, end]) => start < to && from < end);
+
+  // Two objects can describe the same bytes of this row — a struct and a union member, or (as in a frame whose field
+  // offsets came out negative, see `layoutPieces`) one that was placed wrongly. Overlapping cells share a grid track
+  // and their labels print on top of each other, which is what "saved x290x7fc1" was. So the row's pieces are
+  // arbitrated: the more specific object claims first (`order`, computed with the rest of the layer), and whatever
+  // it does not cover stays with the other.
   const taken = [];
   const claim = (from, to) => {
     let spans = [[from, to]];
@@ -1942,16 +2069,26 @@ const PAGE = 4096n;
 // managed in and what a reader recognises, and page-aligned folding cannot produce a fold whose edges mean
 // nothing. And the rule about *named* bytes is what keeps this honest — a zero page that a frame or a field
 // covers is not folded, because the zeros there are a fact about that structure, not padding to skip.
+// The layout is **runs, not rows**: a fold contributes one entry, and every other entry is a sixteen-byte row,
+// so a run of ordinary rows is arithmetic. The version this replaces built one object per row for the whole
+// window — measured at **240 384** entries for the heavy core's 3.8 MB stack window, on every render — and
+// needed a prefix-sum array beside it to find a scroll position. Rows are uniform (see `entryHeight`), so the
+// entry at an offset is a division and the offset of an entry is a multiplication. What is left to compute is
+// where the folds are, which is a question about *pages* (940 of them for that window, not 240 384 rows).
 function rowLayout(window, objects) {
   const start = BigInt(window.address);
   const first = start - (start % 16n);
   const end = start + BigInt(window.length);
-  const map = byteMap(window);
   const named = coverage(objects);
-  const entries = [];
+  const runs = [];
 
   const blank = (from, to) =>
-    !named.some(([namedFrom, namedTo]) => namedFrom < to && from < namedTo) && everyByteZero(map, from, to);
+    !named.some(([namedFrom, namedTo]) => namedFrom < to && from < namedTo) && rangeIsZero(window, from, to);
+  const rows = (from, to) => {
+    const last = runs[runs.length - 1];
+    if (last?.kind === "rows" && last.to === from) last.to = to;
+    else runs.push({ kind: "rows", from, to });
+  };
 
   for (let row = first; row < end; ) {
     const pageStart = row - (row % PAGE);
@@ -1959,15 +2096,59 @@ function rowLayout(window, objects) {
       let runEnd = pageStart + PAGE;
       while (runEnd + PAGE <= end && blank(runEnd, runEnd + PAGE)) runEnd += PAGE;
       if (!state.unfolded.has(pageStart.toString())) {
-        entries.push({ kind: "fold", from: pageStart, to: runEnd });
+        runs.push({ kind: "fold", from: pageStart, to: runEnd });
         row = runEnd;
         continue;
       }
     }
-    entries.push({ kind: "row", row });
-    row += 16n;
+    // Ordinary rows, up to the next page boundary the loop above may fold at (or the end of the window).
+    const stop = pageStart + PAGE > end ? end : pageStart + PAGE;
+    rows(row, stop);
+    row = stop;
   }
-  return { entries, first, end, map };
+
+  // Entry index of each run, so a scroll position and an address can both be mapped without walking anything.
+  let index = 0;
+  for (const run of runs) {
+    run.entry = index;
+    run.rows = run.kind === "fold" ? 1 : Number((run.to - run.from) / 16n);
+    index += run.rows;
+  }
+  return { runs, total: index, first, end };
+}
+
+// The entry at an index: a fold, or the address of a sixteen-byte row.
+function entryForIndex(spec, index) {
+  const runs = spec.runs;
+  let low = 0;
+  let high = runs.length - 1;
+  while (low < high) {
+    const middle = (low + high + 1) >> 1;
+    if (runs[middle].entry <= index) low = middle;
+    else high = middle - 1;
+  }
+  const run = runs[low];
+  if (!run) return null;
+  if (run.kind === "fold") return run;
+  return { kind: "row", row: run.from + BigInt(index - run.entry) * 16n };
+}
+
+// The entry an address is on. Folding is why a row *number* and an address are no longer in step, which is the
+// question this answers: binary search by address, then arithmetic inside the run.
+function indexForAddress(spec, address) {
+  const runs = spec.runs;
+  let low = 0;
+  let high = runs.length - 1;
+  while (low < high) {
+    const middle = (low + high + 1) >> 1;
+    if (runs[middle].from <= address) low = middle;
+    else high = middle - 1;
+  }
+  const run = runs[low];
+  if (!run) return 0;
+  if (run.kind === "fold") return run.entry;
+  const offset = address < run.from ? 0n : (address - run.from) / 16n;
+  return run.entry + Number(offset);
 }
 
 // The byte ranges something is named in: the objects themselves, deepened by their fields. This is the same
@@ -1988,14 +2169,7 @@ function coverage(objects) {
   return ranges.sort((a, b) => (a[0] < b[0] ? -1 : 1));
 }
 
-// Every byte of the range present **and** zero. A page the dump does not carry is not zero: it is missing,
-// and the two must not fold into the same picture.
-function everyByteZero(map, from, to) {
-  for (let address = from; address < to; address += 1n) {
-    if (map.get(address.toString()) !== 0) return false;
-  }
-  return true;
-}
+// A page folds when it is present, zero, and unnamed — the three questions `rangeIsZero` and `coverage` answer.
 
 // The lines that belong beside one sixteen-byte row, when this window is code: the source line where it
 // changes, and every instruction that lives in those bytes.
@@ -2048,31 +2222,16 @@ function entryHeight(entry, spec) {
   // path may want it again, and because the signature is what the caller already passes.
   return ROW_HEIGHT;
 }
+// The content height, which is now a multiplication: every entry is one row tall (`entryHeight`), so a
+// 240 384-entry window is `240384 * 19` pixels and needs no array to say so.
 function layoutTops(spec) {
-  if (spec.tops && spec.topsFor === spec.entries.length && spec.topsCode === spec.codeRows) return;
-  const tops = new Array(spec.entries.length);
-  let y = 0;
-  for (let index = 0; index < spec.entries.length; index += 1) {
-    tops[index] = y;
-    y += entryHeight(spec.entries[index], spec);
-  }
-  spec.tops = tops;
-  spec.totalHeight = y;
-  spec.topsFor = spec.entries.length;
-  spec.topsCode = spec.codeRows;
-  state.contentHeight = y; // the minimap's viewport rectangle and its drag both need the real height
+  spec.totalHeight = spec.total * ROW_HEIGHT;
+  state.contentHeight = spec.totalHeight; // the minimap's viewport rectangle and its drag both need the real height
 }
 
-// The entry a pixel offset falls in. Binary search rather than division: rows are not all the same height.
-function entryAt(tops, y) {
-  let low = 0;
-  let high = tops.length - 1;
-  while (low < high) {
-    const middle = (low + high + 1) >> 1;
-    if (tops[middle] <= y) low = middle;
-    else high = middle - 1;
-  }
-  return low;
+// The entry a pixel offset falls in — a division, because the rows are uniform.
+function entryAt(_spec, y) {
+  return Math.max(0, Math.floor(y / ROW_HEIGHT));
 }
 
 // Which address is at the top of the viewport, and where that address is now.
@@ -2083,50 +2242,48 @@ function entryAt(tops, y) {
 // it). Storing the *address* instead means every render can put the reader back on the row they were looking at,
 // whatever the rows around it now measure.
 function topAddressAt(spec, offset) {
-  if (!spec || !spec.tops || !spec.entries?.length || offset === null || offset === undefined) return null;
-  const entry = spec.entries[entryAt(spec.tops, offset)];
+  if (!spec?.runs?.length || offset === null || offset === undefined) return null;
+  const entry = entryForIndex(spec, entryAt(spec, offset));
   if (!entry) return null;
   return entry.kind === "fold" ? entry.from : entry.row;
 }
 
 function offsetOfTopAddress(spec, address) {
-  if (!spec || !spec.tops || address === null || address === undefined) return null;
+  if (!spec?.runs?.length || address === null || address === undefined) return null;
   const start = typeof address === "bigint" ? address : parseAddr(address);
   if (start === null) return null;
-  const index = entryOf(spec, start);
-  const entry = spec.entries[index];
+  const index = indexForAddress(spec, start);
+  const entry = entryForIndex(spec, index);
   const found =
     entry &&
     (entry.kind === "fold"
       ? entry.from <= start && start < entry.to
       : entry.row <= start && start < entry.row + 16n);
-  return found ? Math.max(0, spec.tops[index] ?? 0) : null;
+  return found ? Math.max(0, index * ROW_HEIGHT) : null;
 }
 
 function hexRows(spec) {
   layoutTops(spec);
-  const { entries, tops, totalHeight } = spec;
-  const total = entries.length;
+  const total = spec.total;
   // Scroll position and viewport height come from `state`, not from the DOM: `render()` empties the app
   // before it builds anything, so at this moment there is no pane to ask — and asking the DOM here silently
   // pinned every pane to row zero while the scrollbar itself moved.
   const viewport = state.viewportRows * ROW_HEIGHT || 760;
   const scrolled = state.scrollTop || 0;
-  const from = Math.max(0, entryAt(tops, scrolled) - ROW_MARGIN);
-  const to = Math.min(total, entryAt(tops, scrolled + viewport) + ROW_MARGIN + 1);
+  const from = Math.max(0, entryAt(spec, scrolled) - ROW_MARGIN);
+  const to = Math.min(total, entryAt(spec, scrolled + viewport) + ROW_MARGIN + 1);
 
   const rows = [];
-  if (from > 0) rows.push(h("div", { class: "rowgap", style: `height:${tops[from]}px` }));
+  if (from > 0) rows.push(h("div", { class: "rowgap", style: `height:${from * ROW_HEIGHT}px` }));
   for (let index = from; index < to; index += 1) {
-    const entry = entries[index];
+    const entry = entryForIndex(spec, index);
+    if (!entry) continue;
     rows.push(
-      entry.kind === "fold"
-        ? foldRow(entry)
-        : hexRow(spec.objects, spec.target, spec.crashPc, spec.map, entry.row, spec),
+      entry.kind === "fold" ? foldRow(entry) : hexRow(spec.objects, spec.target, spec.crashPc, spec.window, entry.row, spec),
     );
   }
   if (to < total) {
-    const below = totalHeight - tops[to];
+    const below = (total - to) * ROW_HEIGHT;
     rows.push(h("div", { class: "rowgap", style: `height:${Math.max(0, below)}px` }));
   }
   return rows;
@@ -2157,17 +2314,7 @@ function foldRow(entry) {
 
 // The entry a given address is on. A jump has to land on the entry, not on a row index, because folding
 // means the two are no longer the same number.
-function entryOf(spec, address) {
-  for (let index = 0; index < spec.entries.length; index += 1) {
-    const entry = spec.entries[index];
-    if (entry.kind === "fold") {
-      if (entry.from <= address && address < entry.to) return index;
-    } else if (entry.row <= address && address < entry.row + 16n) {
-      return index;
-    }
-  }
-  return 0;
-}
+
 
 // The bytes a selection should cover at an address: the *field* the debug information places there, and nothing
 // else. Null means the mark stays the single byte, which is the honest answer for an address the debug info does not
@@ -2199,7 +2346,10 @@ function objectCovering(objects, address) {
   return best;
 }
 
-function hexRow(objects, target, crashPc, map, row, spec = null) {
+function hexRow(objects, target, crashPc, window, row, spec = null) {
+  // The row's sixteen bytes, read once: `bytesAt` walks the window's chunks, and asking it sixteen times for
+  // the same row would repeat the same search sixteen times.
+  const sixteen = bytesAt(window, row, 16);
   const pieces = rowPieces(objects, row);
   const owners = byteOwners(pieces, row);
   const cells = [];
@@ -2216,7 +2366,7 @@ function hexRow(objects, target, crashPc, map, row, spec = null) {
   const selection = state.selection;
   for (let i = 0; i < 16; i += 1) {
       const address = row + BigInt(i);
-      const byte = map.get(address.toString());
+      const byte = sixteen[i];
       const selected = target !== null && address === target;
       const isCrash = crashPc !== null && address === crashPc;
       // The bytes carry the colour of the field they belong to: that, and not a label column to be
@@ -2452,7 +2602,7 @@ function stackOverlayNote(window) {
 }
 
 function hexPane(window, target) {
-  const map = byteMap(window);
+
   const start = BigInt(window.address);
   // The window is a whole region, so it starts where the region starts, not where the address of interest
   // happens to be: a hex view whose first row is mid-region cannot show you what is below.
@@ -2465,7 +2615,7 @@ function hexPane(window, target) {
   // to scroll to is an entry index now — folding means "row number" and "address" are no longer in step.
   const region = regionOf(start);
   const layout = rowLayout(window, objects);
-  const spec = { window, objects, target, crashPc, map, start, first, end: layout.end, entries: layout.entries };
+  const spec = { window, objects, target, crashPc, start, first, end: layout.end, runs: layout.runs, total: layout.total };
   // Code rows are built here, before anything measures a row: a row's height *is* its listing, so the layout
   // cannot be computed without knowing what belongs beside those sixteen bytes. `spec.code` is what tells the
   // builder whether this window is code at all — a heap window gets the DWARF overlay instead.
@@ -2481,14 +2631,14 @@ function hexPane(window, target) {
   state.paneTop = null;
   if (state.reveal && target !== null) {
     layoutTops(spec);
-    const index = entryOf(spec, target);
-    const entry = spec.entries[index];
+    const index = indexForAddress(spec, target);
+    const entry = entryForIndex(spec, index);
     const found =
       entry &&
       (entry.kind === "fold"
         ? entry.from <= target && target < entry.to
         : entry.row <= target && target < entry.row + 16n);
-    if (found) state.paneTop = Math.max(0, (spec.tops[index] ?? 0) - 100);
+    if (found) state.paneTop = Math.max(0, index * ROW_HEIGHT - 100);
   }
   state.rowsSpec = spec;
   // The pages this pane is looking at: the viewport's own range, and the target of a jump, which is where the
@@ -2499,6 +2649,7 @@ function hexPane(window, target) {
     if (anchor !== null && anchor !== undefined) ensurePages(window, anchor);
   }
   const rows = hexRows(spec);
+
 
   const holes = window.unread.reduce((total, hole) => total + hole.length, 0);
   return h(
@@ -2662,11 +2813,8 @@ function followCode() {
 // layout*, not from the scroll position divided by a row height: with runs of pages folded, a pixel is not
 // a fixed number of bytes, and a listing that assumed it would point somewhere nobody is looking.
 function viewportAddress(spec) {
-  const index = Math.min(
-    spec.entries.length - 1,
-    Math.max(0, Math.round((state.scrollTop || 0) / ROW_HEIGHT)),
-  );
-  const entry = spec.entries[index];
+  const index = Math.min(spec.total - 1, Math.max(0, Math.round((state.scrollTop || 0) / ROW_HEIGHT)));
+  const entry = entryForIndex(spec, index);
   if (!entry) return null;
   return entry.kind === "fold" ? entry.from : entry.row;
 }
@@ -2717,13 +2865,23 @@ function minimapImage(spec, height) {
   // window's bytes arrived — every row empty, because there was nothing to read — was cached under a key that
   // never changes afterwards, so the strip stayed blank for the life of the window. The same "the source
   // changed and the cache did not" that the typed index and the rail both had.
-  const key = `${spec.window.address}:${spec.window.length}:${spec.entries.length}:${height}:${spec.map.size}`;
+  const key = `${spec.window.address}:${spec.window.length}:${spec.total}:${height}:${(spec.window.chunks ?? []).length}`;
   if (state.minimapKey === key) return state.minimapImage;
 
   const named = coverage(spec.objects);
+  // The rows are walked in address order and so is `named`, so "is this row named" is a *cursor*, not a search.
+  // It was `named.some(...)` inside the per-row loop: measured on the heavy core's stack window, 240 384 rows
+  // against ~5 000 named ranges is 1.2 *billion* comparisons, and it is what made opening that window hang the
+  // browser for minutes. A cursor makes the whole pass O(rows + ranges).
+  let namedAt = 0;
+  const isNamedRow = (row) => {
+    while (namedAt < named.length && named[namedAt][1] <= row) namedAt += 1;
+    const range = named[namedAt];
+    return Boolean(range && range[0] < row + 16n && row < range[1]);
+  };
   const rows = new Array(height).fill(null); // the 16 column values this line shows, or "fold"
   const tint = new Uint8Array(height);
-  const entries = spec.entries.length || 1;
+  const entries = spec.total || 1;
   // The content extent, not the canvas: a window with sixteen rows in a six-hundred-line strip would draw one
   // mark every forty pixels, which is a picture of nothing. Left over is blank on purpose.
   const lines = Math.min(entries * MINIMAP_MAX_STRETCH, height);
@@ -2732,22 +2890,39 @@ function minimapImage(spec, height) {
   for (let y = 0; y < lines; y += 1) {
     const from = Math.floor((y / lines) * entries);
     const to = Math.max(from + 1, Math.floor(((y + 1) / lines) * entries));
+    // What this line covers, in addresses. A line holds a *range* of rows, and the range's bytes are one
+    // slice of a chunk — so the question "is there anything on this line" is a scan of a hex string, and the
+    // per-byte work happens only on the lines that have something on them. The version this replaces asked
+    // `bytesAt` for all sixteen bytes of **every** row: 240 384 rows × 16 parses on the heavy core's stack
+    // window, on every render, which is where the rest of the browser's stall was.
+    const first = entryForIndex(spec, from);
+    const last = entryForIndex(spec, Math.min(to, spec.total) - 1);
+    if (!first || !last) continue;
+    const low = first.kind === "fold" ? first.to : first.row;
+    const high = last.kind === "fold" ? last.from : last.row + 16n;
+    const lineIsFoldedOnly = first.kind === "fold" && last.kind === "fold";
+    const slice = hexSlice(spec.window, low, high);
+    if (slice === null) {
+      if (lineIsFoldedOnly) rows[y] = "fold";
+      continue;
+    }
+    if (!/[^0]/.test(slice)) {
+      // Every byte present and zero: nothing to draw. A *fold* is the same picture for a different reason.
+      if (lineIsFoldedOnly) rows[y] = "fold";
+      continue;
+    }
+
     const columns = new Uint8Array(16);
     let any = false;
-    let folded = false;
     let isNamed = false;
-
-    for (let index = from; index < to && index < spec.entries.length; index += 1) {
-      const entry = spec.entries[index];
-      if (!entry) continue;
-      if (entry.kind === "fold") {
-        folded = true;
-        continue;
-      }
+    for (let index = from; index < to && index < spec.total; index += 1) {
+      const entry = entryForIndex(spec, index);
+      if (!entry || entry.kind === "fold") continue;
       const row = entry.row;
-      if (named.some(([a, b]) => a < row + 16n && row < b)) isNamed = true;
+      if (isNamedRow(row)) isNamed = true;
+      const sixteen = bytesAt(spec.window, row, 16);
       for (let i = 0; i < 16; i += 1) {
-        const byte = spec.map.get((row + BigInt(i)).toString());
+        const byte = sixteen[i];
         if (!byte) continue;
         // The greatest byte seen in this column: the mark is as bright as the strongest thing behind it.
         if (byte > columns[i]) columns[i] = byte;
@@ -2755,11 +2930,10 @@ function minimapImage(spec, height) {
       }
     }
 
-    if (folded && !any) {
-      rows[y] = "fold";
+    if (!any) {
+      if (lineIsFoldedOnly) rows[y] = "fold";
       continue;
     }
-    if (!any) continue;
     rows[y] = columns;
     tint[y] = isNamed ? 1 : 0;
   }
@@ -2864,7 +3038,7 @@ function paintMinimap(canvas = document.querySelector(".minimap")) {
   // The address on screen comes from the *row layout*, not from the scroll ratio: folding means a pixel is
   // no longer a fixed number of bytes, and a ratio that ignores that reports an address nobody is looking
   // at (it claimed the region's start while the pane showed `sp`).
-  const entry = spec.entries[Math.min(spec.entries.length - 1, Math.max(0, Math.round((state.scrollTop || 0) / ROW_HEIGHT)))];
+  const entry = entryForIndex(spec, Math.min(spec.total - 1, Math.max(0, Math.round((state.scrollTop || 0) / ROW_HEIGHT))));
   const at = entry ? (entry.kind === "fold" ? entry.from : entry.row) : spec.first;
   canvas.title = `${bytes(Number(spec.end - spec.first))} in this window · at ${norm(at)}`;
 }
@@ -3294,10 +3468,10 @@ function windowArch(window) {
 //
 // BigInt, not Number: a 64-bit word does not survive a JavaScript number, and an address that comes back
 // rounded is worse than one that comes back as `—`. The byte order decides which end the first byte is.
-function readWord(map, target, size, order) {
+function readWord(bytes, size, order) {
   let value = 0n;
   for (let index = 0; index < size; index += 1) {
-    const byte = map.get((target + BigInt(index)).toString());
+    const byte = bytes[index];
     if (byte === undefined) return null;
     const shift = order === "big" ? size - 1 - index : index;
     value |= BigInt(byte) << BigInt(8 * shift);
@@ -3310,7 +3484,7 @@ function rawSection(target) {
   const window = windowFor(target);
   const order = windowOrder(window);
   if (!window || !window.chunks || !order) return null;
-  const map = byteMap(window);
+  const eight = bytesAt(window, target, 8);
   const rows = [
     ["u8", 1, false],
     ["i8", 1, true],
@@ -3322,7 +3496,7 @@ function rawSection(target) {
     ["i64", 8, true],
     ["ptr", 8, false],
   ].map(([label, size, signed]) => {
-    const value = readWord(map, target, size, order);
+    const value = readWord(eight, size, order);
     let text = "—";
     if (value !== null) {
       if (signed) {
@@ -3346,11 +3520,9 @@ function rawSection(target) {
     );
   });
 
-  const ascii = [];
-  for (let i = 0; i < 8; i += 1) {
-    const byte = map.get((target + BigInt(i)).toString());
-    ascii.push(byte === undefined ? " " : byte >= 32 && byte < 127 ? String.fromCharCode(byte) : "·");
-  }
+  const ascii = eight.map((byte) =>
+    byte === undefined ? " " : byte >= 32 && byte < 127 ? String.fromCharCode(byte) : "·",
+  );
   rows.push(h("div", { class: "readrow" }, h("span", { class: "rname", text: "as chars" }), h("span", { class: "fval", text: JSON.stringify(ascii.join("")) })));
 
   return h(
@@ -3763,10 +3935,7 @@ function evictFarPages(window, around) {
     return at + BigInt(chunk.length) >= low && at <= high;
   });
   if (kept.length !== (window.chunks ?? []).length) {
-    window.chunks = kept;
-    // `byteMap` caches the decoded map on the window, so it has to go whenever the chunks change — otherwise
-    // freshly fetched pages would never appear and the pane would keep drawing the old ones.
-    window.bytes = null;
+    window.chunks = kept; // still in address order: the filter keeps the order of the list it walked
   }
 }
 
@@ -3805,8 +3974,11 @@ async function ensurePages(window, from, budget = PAGE_BUDGET) {
       } else {
         if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
         window.chunks = [...(window.chunks ?? []), ...(reply.chunks ?? [])];
+        // Sorted, because `byteAt`/`bytesAt` binary-search this list: pages arrive in the order the reader
+        // scrolled, and appending them unsorted would make a lookup missing for reasons that have nothing to do
+        // with the dump. (It used to be a per-byte Map instead, which is why the order never mattered before.)
+        window.chunks.sort((a, b) => (BigInt(a.address) < BigInt(b.address) ? -1 : 1));
         window.unread = [...(window.unread ?? []), ...(reply.unread ?? [])];
-        window.bytes = null; // the decoded map is now stale by exactly these pages
       }
       done += 1;
       state.windowProgress = Math.round((done / pages.length) * 100);
