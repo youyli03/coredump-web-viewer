@@ -223,6 +223,25 @@ def test_the_dump_itself_is_never_a_candidate(tmp_path: pathlib.Path) -> None:
     )
 
 
+def test_a_sysroot_built_from_a_merged_usr_system_resolves_too(tmp_path: pathlib.Path) -> None:
+    """`/lib/…` in the core is `<sysroot>/usr/lib/…` on disk where `/lib` is a symlink to `/usr/lib`.
+
+    Measured need: a core records the paths of the machine it died on, and a sysroot built from a Debian or
+    Ubuntu system keeps the file under `usr/`. Without this rule the file that would name a whole region is
+    inside the sysroot the session was given and is never looked at.
+    """
+    nested = tmp_path / "sysroot" / "usr" / "lib" / "aarch64-linux-gnu"
+    nested.mkdir(parents=True)
+    (nested / "libc.so.6").write_bytes(b"\x7fELF" + b"\x00" * 12 + (3).to_bytes(2, "little"))
+
+    found = matching.candidate_files(
+        libraries=[{"name": "/lib/aarch64-linux-gnu/libc.so.6"}],
+        sysroot=str(tmp_path / "sysroot"),
+    )
+    assert [entry["source"] for entry in found] == ["sysroot + usr/lib/aarch64-linux-gnu/libc.so.6"]
+    assert found[0]["path"].endswith("usr/lib/aarch64-linux-gnu/libc.so.6")
+
+
 def test_candidates_are_deduplicated_resolved_and_bounded(tmp_path: pathlib.Path) -> None:
     libraries = [{"name": "/lib/libc.so.6", "host_name": str(tmp_path / "libc.so.6")}]
     (tmp_path / "libc.so.6").write_bytes(b"\x7fELF" + b"\x00" * 12 + (3).to_bytes(2, "little"))

@@ -498,7 +498,16 @@ def candidate_files(
             # gdb's own two rules, in gdb's own order: a sysroot replaces the leading `/` of the target path,
             # and a search path is tried against the object's base name.
             root_path = pathlib.Path(root)
-            add(root_path / name.lstrip("/"), f"{label} + {name}")
+            relative = name.lstrip("/")
+            add(root_path / relative, f"{label} + {name}")
+            # And the merged-`/usr` spelling of the same file. A core from a Debian or Ubuntu system records
+            # `/lib/aarch64-linux-gnu/libc.so.6`, and in the sysroot built from that system the file is at
+            # `usr/lib/aarch64-linux-gnu/libc.so.6`, because `/lib` is a symlink to `/usr/lib` there. Without
+            # this the one file that would name a whole region is sitting in the sysroot the session was given
+            # and is never looked at — the fixtures in this checkout do not need it (`tmp/practice` and
+            # `tmp/heavy` keep the flat spelling), which is exactly why it is written down here.
+            if not relative.startswith("usr/"):
+                add(root_path / "usr" / relative, f"{label} + usr/{relative}")
             add(root_path / pathlib.PurePosixPath(name).name, f"{label} + {name}")
     for root, label in roots:
         # A bundle of libraries handed over without a link map: every file beside them is a candidate, and the
