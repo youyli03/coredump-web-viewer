@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from analysis.gdb.mi import (
+    _APPLY_CHUNK,
     FRAME_RECORDS,
     MiTransport,
     _frame_record,
@@ -82,6 +83,34 @@ LOCATION_BY_NAME: dict[str, str] = {
     "seed": 'Symbol "seed" is a complex DWARF expression:\n    0: DW_OP_addr 0x555c932150\n.\n',
 }
 
+
+def _registers(level: int) -> dict[str, str]:
+    """`$sp`/`$fp` at one level: the verbatim three where they exist, a generated walk above them.
+
+    The generated values are not captured from a core — nothing on a real core has a 600-frame walk in this
+    fixture — but they are *this* fake's answers, and the property under test is which commands were sent and
+    whether every frame got an answer, not what the answer was.
+    """
+    if level in REGISTERS_BY_LEVEL:
+        return REGISTERS_BY_LEVEL[level]
+    address = hex(0x7FEB1F9E20 + level * 0x40)
+    return {"$sp": address, "$fp": address}
+
+
+def _stack_reply(levels: int) -> str:
+    """A `-stack-list-frames` reply of `levels` frames, in the same shape as the verbatim one."""
+    if levels == len(REGISTERS_BY_LEVEL):
+        return STACK_FRAMES
+    frames = ",".join(
+        f'frame={{level="{level}",addr="{hex(0x555C921188 + level * 0x10)}",func="descend",'
+        f'file="/home/lyy/cdwv-practice/practice/src/crash_target.c",'
+        f'fullname="/home/lyy/cdwv-practice/practice/src/crash_target.c",'
+        f'line="41",arch="aarch64"}}'
+        for level in range(levels)
+    )
+    return f"^done,stack=[{frames}]"
+
+
 def _mi_stream(text: str) -> list[dict[str, Any]]:
     """A console record carrying `text`, escaped the way MI really carries it.
 
@@ -102,17 +131,20 @@ FRAME_2 = 2
 class FakeGdb:
     """A canned gdb that remembers which frame is selected, because `$sp` depends on it."""
 
-    def __init__(self, *, frame_apply: bool = True) -> None:
+    def __init__(self, *, frame_apply: bool = True, levels: int = len(REGISTERS_BY_LEVEL)) -> None:
         self.commands: list[str] = []
         self.selected = 0
         self.frame_apply = frame_apply
         """Whether this gdb knows `frame apply` (gdb 8.1 and later). False models an older one, which the
         transport has to answer one frame at a time rather than refusing to answer at all."""
+        self.levels = levels
+        """How deep this fake's stack is. The three verbatim frames by default; a larger number generates a
+        longer walk of the same shape, which is what a range wider than one `frame apply` needs."""
 
     def exec(self, command: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         self.commands.append(command)
         if command.startswith("-stack-list-frames"):
-            return parse_records([STACK_FRAMES])
+            return parse_records([_stack_reply(self.levels)])
         if command.startswith("-stack-select-frame"):
             self.selected = int(command.rsplit(" ", 1)[-1])
             return parse_records(["^done"])
@@ -128,7 +160,7 @@ class FakeGdb:
             # self-describing — a frame whose registers cannot be read leaves a gap that shifts nothing.
             lines = []
             for level in range(int(first), int(last) + 1):
-                registers = REGISTERS_BY_LEVEL[level]
+                registers = _registers(level)
                 lines.append(f"#{level} 0x0000c585b55d0e38 in descend (depth={level}) at big.c:114")
                 lines.append(f"{registers['$sp']} {registers['$fp']}")
             return _mi_stream("\n".join(lines) + "\n")
@@ -140,7 +172,7 @@ class FakeGdb:
         if command.startswith("-data-evaluate-expression"):
             expression = command.split(" ", 1)[1].strip().strip('"')
             if expression in ("$sp", "$fp"):
-                value = REGISTERS_BY_LEVEL[self.selected][expression]
+                value = _registers(self.selected)[expression]
                 return parse_records([f'^done,value="{value}"'])
             if expression == "&(head)":
                 # CONSTRUCTED, not captured: gdb has no address for a variable that lives in a register,
@@ -166,9 +198,9 @@ class FakeGdb:
         return parse_records(["^done"])
 
 
-def _transport(*, frame_apply: bool = True) -> tuple[MiTransport, FakeGdb]:
+def _transport(*, frame_apply: bool = True, levels: int | None = None) -> tuple[MiTransport, FakeGdb]:
     transport = MiTransport(gdb_path="gdb", core_path="core")
-    fake = FakeGdb(frame_apply=frame_apply)
+    fake = FakeGdb(frame_apply=frame_apply, **({} if levels is None else {"levels": levels}))
     transport._exec = fake.exec  # type: ignore[method-assign]
     return transport, fake
 
@@ -420,3 +452,43 @@ def test_a_range_of_frames_is_asked_for_in_one_command() -> None:
     before = len(fake.commands)
     transport.stack_frames(1, low=0, high=2)
     assert not [c for c in fake.commands[before:] if "frame apply" in c or "stack-select-frame" in c]
+
+
+def test_a_deep_range_is_asked_for_in_bounded_commands() -> None:
+    """One `frame apply` per 256 frames, because an unbounded one is a command that cannot answer in time.
+
+    The batch that made a window cheap is the thing that made a *whole stack* fatal: `/stack` with no `limit`
+    asked for all 30 002 frames of the deep sample in one command, the 30 s deadline fired while gdb was still
+    unwinding, and the reply was `502 gdb-died` — the session killed by its own question. A chunk is a bounded
+    amount of work, so the deadline can fire on nothing but a genuinely stuck gdb.
+    """
+    transport, fake = _transport(levels=600)
+    frames = transport.stack_frames(1, low=0, high=599)
+
+    spans = [
+        tuple(int(part) for part in command.split("frame apply level ", 1)[1].split(" ", 1)[0].split("-"))
+        for command in fake.commands
+        if "frame apply level" in command
+    ]
+    assert spans == [(0, 255), (256, 511), (512, 599)], spans
+    assert all(last - first + 1 <= _APPLY_CHUNK for first, last in spans)
+    # Every frame of the range is answered from the batches: no frame needed selecting on its own.
+    assert not [c for c in fake.commands if c.startswith("-stack-select-frame")]
+    assert len(frames) == 600
+    assert frames[599]["sp"] == _registers(599)["$sp"]
+
+
+def test_a_gdb_without_frame_apply_still_answers_a_deep_range() -> None:
+    """The fallback covers what the batches could not, and one refusal ends the batching rather than the answer.
+
+    A gdb older than 8.1 has no `frame apply` at all; the frames still have to come back, one selection each.
+    """
+    transport, fake = _transport(frame_apply=False, levels=300)
+    frames = transport.stack_frames(1, low=0, high=299)
+
+    selects = [c for c in fake.commands if c.startswith("-stack-select-frame")]
+    assert selects == [f"-stack-select-frame {level}" for level in range(300)], (
+        f"every frame needs one selection when there is no batch to be had, and got {len(selects)}"
+    )
+    assert frames[299]["sp"] == _registers(299)["$sp"]
+    assert frames[0]["sp"] == REGISTERS_BY_LEVEL[0]["$sp"]

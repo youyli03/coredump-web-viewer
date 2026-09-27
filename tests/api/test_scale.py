@@ -40,6 +40,10 @@ def _heavy_core() -> pathlib.Path | None:
 @pytest.fixture
 def heavy(tmp_path: pathlib.Path):
     """A session on the heavy core, opened the way a user opens a foreign dump: paths, not a sample name."""
+    yield from _heavy_session(tmp_path, command_timeout_s=300)
+
+
+def _heavy_session(tmp_path: pathlib.Path, *, command_timeout_s: float):
     import dataclasses
     import os
 
@@ -53,7 +57,7 @@ def heavy(tmp_path: pathlib.Path):
         pytest.skip(f"needs the heavy bundle in {HEAVY} and a cross gdb (see this module's docstring)")
 
     app = create_app(
-        dataclasses.replace(CONFIG, gdb_path=str(gdb), command_timeout_s=300),
+        dataclasses.replace(CONFIG, gdb_path=str(gdb), command_timeout_s=command_timeout_s),
         root=ROOT,
         state_path=tmp_path,
         bundle=HEAVY,
@@ -133,6 +137,40 @@ def test_a_window_far_down_a_deep_stack_costs_a_window(heavy) -> None:
         f"a window 20 000 frames down cost {far} commands against {near} at the top: the walk is O(offset) "
         "again, and a scroll of a deep stack is O(depth) per scroll"
     )
+
+
+@pytest.mark.gdb
+def test_a_wide_window_is_a_window_and_not_the_whole_walk(heavy) -> None:
+    """**The second regression this file found**: a batch must be *bounded*, or it takes the session with it.
+
+    The `frame apply` that made a window cheap (22 commands against 87) made a wide range fatal when it was sent
+    as one command: `/stack` with no `limit` — what the UI asks for when the stack view opens — covered all
+    30 002 frames in a single command, the 30 s deadline fired while gdb was still unwinding, and the reply was
+    `502 gdb-died`, because a missed deadline kills the debugger rather than answering late. Measured before the
+    fix: `502 in 30.0s, 2 commands`.
+
+    That this request *answers* is what is asserted here; the ceiling itself is pinned where it can be pinned
+    deterministically — `tests/unit/test_mi_stack.py` asserts the spans of a 600-frame range, and fails if the
+    command is one unbounded range again. A deadline assertion here would be a claim about this machine's clock.
+    """
+    client, loaded = heavy
+    session = loaded["id"]
+    crashed = next(t["num"] for t in loaded["summary"]["threads"] if t["is_crashed"])
+
+    reply = client.get(
+        f"/api/sessions/{session}/stack", params={"thread": crashed, "offset": 20000, "limit": 1024}
+    )
+    assert reply.status_code == 200, reply.text
+    body = reply.json()
+    assert [frame["level"] for frame in body["frames"]] == list(range(20000, 21024))
+    assert body["truncated"] is True, "19 978 frames above it and ~29 000 below: neither side is the whole stack"
+    assert all(frame["record"]["verified"] for frame in body["frames"]), (
+        "and every one of the 1 024 has a frame record that agrees with its caller"
+    )
+
+    stats = client.get(f"/api/sessions/{session}/stats").json()
+    assert stats["timeouts"] == 0, "no command missed its deadline, and gdb is still the one that loaded the core"
+    assert stats["gdb_alive"] is True
 
 
 @pytest.mark.gdb

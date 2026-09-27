@@ -304,6 +304,21 @@ def _memory_reply(entries: Iterable[Any], addr: str, length: int) -> dict[str, A
 
 _NO_FUNCTION = re.compile(r"no function contains", re.I)
 
+_APPLY_CHUNK = 256
+"""How many frames one `frame apply` command may cover.
+
+A range is not free at its far end — reaching frame A is work inside gdb before the range is even run — and
+the command is a promise to the caller: it has to answer inside the command deadline, or the transport kills
+gdb and the session dies with it. Measured on the 30 000-frame sample, a range costs roughly 0.9 ms per frame
+plus the walk to its start: 256 frames took 0.03 s at level 0 and 1.04 s at level 20 000, and 1 024 took 0.20 s
+and 4.23 s at the same two starts.
+
+The ceiling was not a tidy-up. Asking for that whole stack in **one** command — which is what `/stack` with no
+`limit` does, because the UI asks for all of it — was still unwinding when the 30 s deadline fired, and the
+answer was `502 gdb-died`: a reasonable question, a killed debugger, and a session that had to be reopened.
+256 frames keeps a whole-stack request to 118 bounded commands and a ~1 s worst case on this machine.
+"""
+
 
 def _instruction(entry: Any, line: int | None) -> dict[str, Any] | None:
     """One `asm_insns` entry, in the one shape the viewer needs.
@@ -1123,17 +1138,23 @@ class MiTransport(Transport):
         return _frame_record(frame.get("arch"), fp, bytes.fromhex(raw))
 
     def _frame_locations(self, thread_num: int, first: int, upto: int) -> dict[int, dict[str, int | None]]:
-        """`sp` and `fp` of the frames in `[first, upto]`, asked frame by frame.
+        """`sp` and `fp` of the frames in `[first, upto]`, in bounded batches and cached per level.
 
-        There is no cheaper way: an MI frame tuple carries `addr` (the pc) and neither `sp` nor `fp`. That is
-        one `-stack-select-frame` and two evaluations per frame, so it is fetched lazily and cached per level —
-        the range of a frame needs *its caller's* `sp`, which is why `upto` is one frame above the window.
+        There is no cheaper way: an MI frame tuple carries `addr` (the pc) and neither `sp` nor `fp`. The
+        batches are `frame apply level A-B`, so the cost is a few commands per *window* instead of two per
+        frame; whatever a batch cannot answer is asked one frame at a time.
 
         **It starts at `first`, not at frame 0**, and that is not a micro-optimisation. Measured on a core with
         a 30 000-frame stack: asking for twenty frames at offset 20 000 walked twenty thousand of them first —
         45 321 gdb commands and **52 seconds** for one scroll, where the window itself is twenty frames. A
         stack that deep is the case requirements §5 names, and a viewer whose cost is O(depth) per scroll has
         no answer for it.
+
+        The batches are **chunked** (`_APPLY_CHUNK`), because one command that covers the whole stack is a
+        command that cannot answer inside the deadline — and a command that misses the deadline takes the
+        session with it. Measured, and it is why the ceiling exists: `/stack` with no `limit` on that same core
+        asked for all 30 002 frames in one `frame apply`, the 30 s deadline fired while gdb was still unwinding,
+        and the reply was `502 gdb-died` with the debugger killed underneath a perfectly reasonable question.
         """
         cached = self._located.setdefault(thread_num, {})
         frames = self._frames(thread_num)
@@ -1147,18 +1168,16 @@ class MiTransport(Transport):
             return cached
 
         self._select_thread(thread_num)
-        if self._apply_locations(missing[0], missing[-1], cached):
-            return cached
-
-        # One frame at a time. Not dead code: `frame apply` arrived in gdb 8.1, this transport is meant to work
-        # with whatever gdb a machine has (the same rule as the capability probes), and a refusal or an output
-        # shape this does not recognise is a slower answer rather than a failed one.
-        for frame in frames:
-            level = frame["level"]
-            if level is None or level < first:
-                continue
-            if level > upto:
+        for start in range(0, len(missing), _APPLY_CHUNK):
+            chunk = missing[start : start + _APPLY_CHUNK]
+            if not self._apply_locations(chunk[0], chunk[-1], cached):
                 break
+
+        # Whatever the batches left behind — a gdb older than 8.1 that has no `frame apply` at all, or a chunk
+        # it refused — is asked one frame at a time. Not dead code: this transport is meant to work with
+        # whatever gdb a machine has (the same rule as the capability probes), and a refusal is a slower answer
+        # rather than a failed one.
+        for level in missing:
             if level in cached:
                 continue
             self._select_frame(thread_num, level)
