@@ -92,6 +92,21 @@ def code_page(
     import analysis.report as report  # itself: the helpers live here and are private on purpose
 
     local = report._local_module(owner.get("path"), bundle, sysroot)
+    if local is None:
+        # The functions of a page are read from the *file* that supplied it, and a core does not always say which
+        # file that was: `NT_FILE` is how a Linux dump names its mappings, and a core without it — measured on one
+        # with the note patched out, 18 regions and none named — has no path here at all. Then `units: []` on its
+        # own would read as "this page contains no code", which is a claim about the dump; the truth is that this
+        # viewer has no symbol table to read. Say which.
+        return {
+            "page": hex(page),
+            "units": [],
+            "reason": (
+                "this core names no file for this page, and the session was given no executable to read one "
+                "from, so there is no symbol table to list functions from — the bytes are still here "
+                "(disassemble with a range, or name the binary and reload)"
+            ),
+        }
     # The core's own map first, and it is *checked* rather than trusted: the base is the candidate that lands
     # the module's sections inside the core's mapped regions. The frame-based base stays as the fallback for a
     # module whose file cannot be read at all.

@@ -131,6 +131,27 @@ frontend and the tests branch on, and 409-from-a-session and 409-from-a-transpor
 the UI. The same is true of 422: an unparseable query string is a client mistake, while `unreadable` is the
 dump itself refusing, and only one of those should ever put an error in front of a user.
 
+### 3.1a A core that names none of its files
+
+`analysis/elf.py` takes a mapping's **name** from the core's `NT_FILE` note, which is a Linux convention: it is how
+a `gcore` says which file each range came from. A core without it has every region anonymous — measured on the
+x86-64 fixture with the note's type patched out: **18 regions, 0 named, `kind: anon` for each** — and that is the
+shape a QNX core is expected to have (not measured here: this machine has no QNX core and no `nto*-gdb`, so
+whether they carry the note is an open question, see `AGENTS.local.md`).
+
+What a session does with such a core, measured end to end:
+
+| | |
+|---|---|
+| loads | `ready`; the stack is found through `$sp`, not by name, so `stack` still appears as a window |
+| `symbolize` | places the address in its mapping (`r-xp`, `path: null`) and states the missing function: *"this address is in code but gdb named no function for it"* |
+| `/disassemble` | **`units: []` with a `reason`**: *"this core names no file for this page, and the session was given no executable to read one from, so there is no symbol table to list functions from — the bytes are still here (disassemble with a range, or name the binary and reload)"*. Without the reason an empty list reads as "this page contains no code", which is a claim about the dump where the truth is a statement about this viewer |
+| the names that are missing | the region chips (`[anon]` instead of `libc.so.6`), the summary's text window (it is chosen by a named module), and frame `file`/`line` |
+
+Naming the binary (`exe`) — and its module directory (`solib_search_path`) — is what brings the names back, which
+is why those are session inputs rather than assumptions. `tests/api/test_foreign.py` builds this shape from the
+x86-64 fixture (patching the note's type) so it is pinned without needing a QNX core.
+
 ### 3.2 The memory window: what is there, what is not, and what was never asked about
 
 `GET …/memory` answers three states, and they must not be confused — `requirements.md` C3 asks for the bytes

@@ -164,6 +164,77 @@ def test_a_core_without_its_binary_borrows_nothing(tmp_path: pathlib.Path, core_
 
 
 # --------------------------------------------------------------------------- #
+# A core that names none of its files
+# --------------------------------------------------------------------------- #
+def test_a_core_that_names_no_files_says_so_instead_of_showing_an_empty_page(tmp_path: pathlib.Path) -> None:
+    """**The QNX-shaped case, made reproducible.** A dump whose mappings carry no names.
+
+    `NT_FILE` is how a Linux dump says *which file* each mapping came from, and `analysis/elf.py` reads it; a core
+    without that note has every region anonymous — measured on the x86-64 fixture with the note's type patched
+    out: 18 regions, **0 named**, `kind: anon` for each. QNX is the real-world reason to care (whether `nto*-gdb`
+    cores carry this Linux note is not something this machine can answer — see `AGENTS.local.md`), and this test
+    builds the shape rather than waiting for one.
+
+    What the session does with such a core is the point, and it is mostly right already: it loads, the stack is
+    found through `$sp` rather than by name, the crash frame's address is still placed in its mapping. What was
+    **not** right is the code page: with no file for the page and no executable given, `units: []` came back with
+    no reason at all, which reads as "this page contains no code" — a claim about the dump, where the truth is
+    that this viewer has no symbol table to read. That is what this pins.
+    """
+    fixture = FOREIGN / "core_linux64.elf"
+    if not fixture.is_file() or not X86_64_GDB.exists():
+        pytest.skip(f"needs {fixture} and a matching gdb ({X86_64_GDB})")
+
+    import dataclasses
+
+    from analysis import elf
+
+    # The note's type is the one word that makes it a `NT_FILE`; everything else in the dump stays as it was.
+    raw = fixture.read_bytes()
+    note_type = (0x46494C45).to_bytes(4, "little")
+    assert raw.count(note_type) == 1, "the fixture carries exactly one NT_FILE note"
+    unnamed = tmp_path / "core_linux64_unnamed.elf"
+    unnamed.write_bytes(raw.replace(note_type, (0xDEADBEEF).to_bytes(4, "little")))
+
+    regions = elf.memory_map(unnamed)
+    assert regions and not any(region["path"] for region in regions), (
+        "the shape under test is a core where no mapping names a file"
+    )
+
+    app = create_app(
+        dataclasses.replace(CONFIG, gdb_path=str(X86_64_GDB)),
+        root=ROOT,
+        state_path=tmp_path,
+        bundle=tmp_path / "no-bundle",
+    )
+    with TestClient(app) as client:
+        created = client.post("/api/sessions", json={"core": str(unnamed)})
+        assert created.status_code == 201, created.text
+        session = created.json()["id"]
+        loaded = client.get(f"/api/sessions/{session}", params={"wait": 60}).json()
+        assert loaded["state"] == "ready", loaded.get("error")
+
+        # The stack is *found*, not searched for by name: `$sp`, as the transport asks it.
+        summary = loaded["summary"]
+        assert any(window["name"] == "stack" for window in summary["memory"]["windows"]), (
+            "a stack with no name is still a stack"
+        )
+        crashed = next(t["num"] for t in summary["threads"] if t["is_crashed"])
+        pc = summary["detail"][str(crashed)]["frames"][0]["pc"]
+
+        # The address is placed, and the missing function is stated rather than left blank.
+        found = client.get(f"/api/sessions/{session}/symbolize", params={"address": pc}).json()
+        assert found["segment"]["perms"].endswith("xp"), "the pc is in an executable mapping"
+        assert found["segment"]["path"] is None
+        assert found["function"] is None and found["why"]["function"], "an absence with a sentence"
+
+        # And the code page answers with a *reason*, not with an empty list that reads like a fact about the dump.
+        page = client.get(f"/api/sessions/{session}/disassemble", params={"address": pc}).json()
+        assert page["units"] == []
+        assert "no file for this page" in (page.get("reason") or ""), page
+
+
+# --------------------------------------------------------------------------- #
 # A core of another architecture
 # --------------------------------------------------------------------------- #
 def test_a_core_of_another_architecture_needs_its_own_gdb(tmp_path: pathlib.Path) -> None:
