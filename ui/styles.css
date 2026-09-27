@@ -393,8 +393,17 @@ button.scell.field.leads:hover { outline: 1px solid rgba(var(--tint), .9); }
 
 /* Union members and bit-fields that share their bytes with the row above: listed, but visibly second. */
 
-.overlay-legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; padding: 4px 10px 6px; font-size: 11px; color: var(--dim); }
-.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+/* One line, always. The legend used to wrap, and a wrapped legend is not a legend: the second line starts
+   under the first *swatch*, so "nothing behind it" no longer lines up with its own colour — the row reads as a
+   paragraph about colours rather than as a key to them. It scrolls sideways when the pane is narrow instead,
+   which is the same bargain the hex rows make: the content keeps its shape and the reader moves along it. */
+.overlay-legend {
+  display: flex; gap: 14px; align-items: center; padding: 4px 10px 6px;
+  font-size: 11px; color: var(--dim);
+  flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  scrollbar-width: thin;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; white-space: nowrap; }
 .legend-swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; background: rgba(var(--tint), .55); }
 /* The field rail: the complete field list, beside the bytes. Values wrap rather than clip — the whole point
    of the rail is that the overlay's labels do not fit between two byte columns. */
