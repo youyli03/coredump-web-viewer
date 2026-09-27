@@ -28,6 +28,15 @@ The arithmetic:
 * **verification** — the same is done at a second probe, half the region further on, and only the candidates
   that hold at **both** offsets are reported as `verified`. One window can coincide; two offsets inside one
   region cannot, and the runtime that would have to fake it is not one this viewer is trying to impress.
+
+**Resemblance is the weakest thing this module reports, and it knows it.** Before any of that arithmetic runs,
+the mapping's own **build-id** is read out of its bytes (`analysis/elfimage.py`: an ELF image carries
+`.note.gnu.build-id`, which names *this build* in 20 bytes — the trick LLDB uses on an ELF core, commit
+`536abf8`). A candidate whose build-id equals it is the file, exactly and verifiably, and that is reported as
+`basis: "build-id"` rather than as a similarity. A candidate that *disagrees* is reported as `build_id_match:
+false`, which is the answer to "is this library the one the dump ran?" — the question a 4 693-of-8 192 byte
+ratio only hints at. The comparison below is what remains for the cases a build-id cannot settle: a mapping
+whose first page is not an ELF header, a file stripped of its note, or bytes that came from no file at all.
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ from __future__ import annotations
 import mmap
 import pathlib
 from typing import Any, Iterable
+
+from analysis import elfimage
 
 PROBE_BYTES = 8192
 """How much of a region is read at each probe: enough to be sure, small enough that a request stays instant."""
@@ -206,10 +217,19 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
 
     `candidates` is `[{"path": …, "source": …}]` from `candidate_files`. The reply always carries `probes` (how
     much was read and from where, so the answer can be re-derived), `tried` (every candidate with what it
-    scored) and either `inference` — the best candidate that held at **both** probe offsets — or `reason`, in the
-    dump's own words where the dump has any. An empty `tried` list is not "no match": it means there was nothing
-    to try, and `reason` says which of those two it is.
+    scored) and either `inference` — the best candidate that held at **both** probe offsets, or one whose
+    build-id is the mapping's — or `reason`, in the dump's own words where the dump has any. An empty `tried`
+    list is not "no match": it means there was nothing to try, and `reason` says which of those two it is.
+
+    Two bases, and the difference is the point. `build_id` is a **record**: the mapping carries
+    `.note.gnu.build-id` and so does the file, and equal ids mean the same build. `content` is a resemblance,
+    counted byte by byte, and is what is left when a mapping is not an ELF image or a file has no note.
     """
+    image = region.get("image") or elfimage.image_of(probe_from_core(core, region))
+    if image is not None:
+        region["image"] = region.get("image") or image
+    build_id = (image or {}).get("build_id")
+
     probes = []
     blank: list[dict[str, Any]] = []
     for at in _probe_offsets(region):
@@ -239,6 +259,10 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
     tried: list[dict[str, Any]] = []
     for candidate in candidates:
         path = pathlib.Path(str(candidate["path"]))
+        # The record first: a file whose build-id is this mapping's is this build, whatever its bytes look like
+        # now (a `.data` page the loader rewrote still came from that exact file).
+        candidate_id = elfimage.build_id_of_file(path)
+        matches_build = bool(build_id and candidate_id and candidate_id == build_id)
         best: dict[str, Any] | None = None
         used: dict[str, Any] | None = None
         for needle_at, needle in primary["needles"]:
@@ -250,7 +274,16 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
                 if best["ratio"] == 1.0:
                     break  # a whole window matching byte for byte cannot be improved on
         if best is None or used is None:
-            tried.append({"path": str(path), "source": candidate.get("source"), "matched": 0, "compared": 0})
+            tried.append(
+                {
+                    "path": str(path),
+                    "source": candidate.get("source"),
+                    "matched": 0,
+                    "compared": 0,
+                    "build_id": candidate_id,
+                    "build_id_match": matches_build,
+                }
+            )
             continue
         reached_floor = best["ratio"] >= MATCH_FLOOR
         # Where the mapping's *first* byte would land. A mapping starts on a page boundary — the kernel maps
@@ -264,16 +297,22 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
             "compared": best["compared"],
             "ratio": best["ratio"],
             "reached_floor": reached_floor,
+            "build_id": candidate_id,
+            "build_id_match": matches_build,
             # Which needle found it, so the inference can be re-derived: a match found through a 512-byte run
             # is weaker evidence than one found through the whole window, and the reply says which it was.
             "needle": used,
         }
         second = _verify(core, region, path, best["offset"], scorer) if scorer else None
         entry["second"] = second
-        entry["verified"] = bool(reached_floor and second and second["ratio"] >= MATCH_FLOOR)
+        # Verified either by the record (build-id) or by two windows of content agreeing. A build-id match needs
+        # neither window: it is not evidence about bytes, it *is* the identity of the build.
+        entry["verified"] = bool(matches_build or (reached_floor and second and second["ratio"] >= MATCH_FLOOR))
         tried.append(entry)
 
-    tried.sort(key=lambda entry: (-int(entry["matched"]), str(entry["path"])))
+    # A build-id match first, and it does not need a second window or a page-aligned derived offset: those are
+    # guards for a resemblance, and this is not one. Only then by bytes, best first.
+    tried.sort(key=lambda entry: (not entry.get("build_id_match"), -int(entry["matched"]), str(entry["path"])))
     answer: dict[str, Any] = {
         "region": _region_facts(region),
         "probes": [
@@ -287,14 +326,32 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
         "tried": tried,
         "inference": None,
     }
+    # The record beats the resemblance, wherever the resemblance stands.
+    recorded = next((entry for entry in tried if entry.get("build_id_match")), None)
+    if recorded is not None:
+        inference = _as_inference(recorded, verified=True, basis="build-id")
+        answer["inference"] = inference
+        rewritten = bool(inference["compared"]) and (inference["ratio"] or 0) < MATCH_FLOOR
+        answer["reason"] = (
+            f"this mapping's build-id is {build_id}, and this file's is the same id: the same build, read out "
+            "of the dump rather than inferred from it"
+            + (
+                " — and the bytes agree only in part, which is what a page rewritten after loading (relocations, "
+                "`.got`, RELRO) looks like"
+                if rewritten
+                else ""
+            )
+        )
+        return answer
+
     if scorer is None:
         # One probe is all this mapping holds, so there is no second offset to check against. The best match is
         # still reported, as an inference the caller can see is unchecked — never as a conclusion.
         best = tried[0] if tried and tried[0].get("reached_floor") else None
         if best is None:
-            answer["reason"] = _no_match_reason(tried)
+            answer["reason"] = _no_match_reason(tried, build_id=build_id)
             return answer
-        answer["inference"] = _as_inference(best, verified=False)
+        answer["inference"] = _as_inference(best, verified=False, basis="content")
         answer["reason"] = (
             "this mapping is too small to check at a second offset, so this is a single-window match rather "
             "than a verified one"
@@ -303,9 +360,9 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
 
     won = next((entry for entry in tried if entry.get("verified") and entry.get("page_aligned")), None)
     if won is None:
-        answer["reason"] = _no_match_reason(tried)
+        answer["reason"] = _no_match_reason(tried, build_id=build_id)
         return answer
-    answer["inference"] = _as_inference(won, verified=True)
+    answer["inference"] = _as_inference(won, verified=True, basis="content")
     answer["reason"] = (
         "inferred from content, not recorded in this dump: the dump names no file for this mapping, and this "
         "session is not putting one into the map — it is saying which file's bytes these are"
@@ -313,18 +370,33 @@ def identify(core: pathlib.Path, region: dict[str, Any], candidates: list[dict[s
     return answer
 
 
-def _no_match_reason(tried: list[dict[str, Any]]) -> str:
+def _no_match_reason(tried: list[dict[str, Any]], *, build_id: str | None = None) -> str:
     """Why nothing matched, naming the closest candidate — a near miss is the most useful thing to report.
 
     Measured on the practice core's libc: its `r--p` mapping is RELRO, so the loader rewrote the pointers in it
     and no window of it is in the file any more, while its other pages are. Saying only "no file matches" would
     hide that the file *is* the one, with one page that cannot be checked against it — and a reader deciding
     whether this dump came from the library they think it did needs exactly that number.
+
+    When the mapping carries a **build-id**, that comes first, because it is the answer to a sharper question:
+    the dump says which build it ran, and if no candidate has it, then the right file is simply not here yet —
+    which is a different situation from "these bytes look like nothing", and one the reader can act on.
     """
     if not tried:
         return (
             "this session was given no file to compare against: name the executable (exe), a sysroot or a "
             "shared-object search path, and the files gdb can reach become candidates"
+        )
+    with_ids = [entry for entry in tried if entry.get("build_id")]
+    if build_id and not any(entry.get("build_id_match") for entry in tried):
+        seen = ", ".join(
+            f"{pathlib.PurePosixPath(str(entry['path'])).name}={entry['build_id']}" for entry in with_ids[:4]
+        )
+        return (
+            f"this mapping is build {build_id}, and no file compared here has that build-id"
+            + (f" ({len(with_ids)} of them name one: {seen})" if seen else "")
+            + " — a different build of the same library agrees only partly, so the file to name is the one with "
+            "this id (`debuginfod-find debuginfo " + build_id + "`)"
         )
     # A candidate whose bytes *are* these bytes but whose derived offset is not a page boundary is not a near
     # miss: it is the coincidence the alignment check exists to refuse, and saying "the closest is X" about it
@@ -374,16 +446,27 @@ def _needles(probe: bytes) -> list[tuple[int, bytes]]:
     return out
 
 
-def _as_inference(entry: dict[str, Any], *, verified: bool) -> dict[str, Any]:
+def _as_inference(entry: dict[str, Any], *, verified: bool, basis: str) -> dict[str, Any]:
+    """One candidate's answer, promoted to an inference.
+
+    Every number is optional and stays absent when it does not exist, because a **build-id match does not need
+    any of them**: it says the file and the mapping are the same build, and the file offset of the mapping's
+    first byte is only derivable from content (`matched == 0` means the comparison reached no conclusion, not
+    that nothing agreed). Reporting `0` there would read as "nothing matched", which is the opposite of what a
+    build-id match says.
+    """
     return {
         "file": entry["path"],
         "source": entry.get("source"),
+        # `build-id` (a record: the same build, read out of the mapping) or `content` (a resemblance, counted).
+        "basis": basis,
+        "build_id": entry.get("build_id"),
         # Where in the file the mapping's first byte would be. Derived from the content, because nothing in the
         # dump records it — an NT_FILE note is the only thing that does, and this is the case it does not cover.
-        "offset": entry["offset"],
-        "matched": entry["matched"],
-        "compared": entry["compared"],
-        "ratio": entry["ratio"],
+        "offset": entry.get("offset"),
+        "matched": entry.get("matched"),
+        "compared": entry.get("compared"),
+        "ratio": entry.get("ratio"),
         "verified": verified,
         "verified_offset": (entry.get("second") or {}).get("at"),
         "verified_matched": (entry.get("second") or {}).get("matched"),
@@ -430,6 +513,10 @@ def _region_facts(region: dict[str, Any]) -> dict[str, Any]:
         "size": region.get("size"),
         "dumped": region.get("dumped"),
         "kind": region.get("kind"),
+        # What these bytes are, when they are an ELF image (`analysis/elfimage.py`): the class, the machine, the
+        # object type, and the build-id that names *this build*. It travels with the answer because it is the
+        # part of it that is a record rather than a resemblance.
+        "image": region.get("image"),
     }
 
 

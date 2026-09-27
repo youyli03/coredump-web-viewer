@@ -23,6 +23,7 @@ _VENDORED = ROOT / "tmp" / "pylibs"
 if _VENDORED.is_dir():
     sys.path.insert(0, str(_VENDORED))
 
+from analysis import elfimage  # noqa: E402
 from analysis.gdb.base import GdbError  # noqa: E402
 from analysis.elf import facts as core_facts  # noqa: E402
 from analysis.elf import memory_map  # noqa: E402
@@ -907,6 +908,11 @@ def build_summary(
     # object from the link map. One command, once per session, and each region says which source named it.
     libraries = transport.libraries()
     regions = memory_map(core, stack_pointer, libraries)
+    # And what each mapping's bytes *are*, when they are an ELF image: four bytes per region decide whether to
+    # look further, and a region that is an image carries its class, machine, object type and — when the note is
+    # in reach — its build-id. That id names an exact build, which is what turns "this looks like libc" into
+    # "this is libc, build 27027b96…", and it is a record read out of the dump rather than an inference.
+    elfimage.annotate(core, regions)
     # And the shape those bytes have to be read *in*: the core's own architecture, word size and byte order,
     # from the same ELF header the regions came from. They travel with the map rather than being re-derived per
     # window, because they are three facts about the whole dump and decoding needs all three to be right.

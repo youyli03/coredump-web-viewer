@@ -260,14 +260,23 @@ own arithmetic:
 ```json
 {
   "address": "0xc9bc60610000",
-  "region": {"start": "0xc9bc60610000", "perms": "r-xp", "size": 8192, "dumped": 4096, "kind": "anon"},
-  "inference": {"file": "…/crash_target", "offset": 0, "matched": 4096, "compared": 4096, "ratio": 1.0,
-                "verified": false, "verified_offset": null},
-  "tried": [{"path": "…/crash_target", "matched": 4096, "compared": 4096, "ratio": 1.0, "offset": 0,
-             "page_aligned": true, "reached_floor": true, "needle": {"at": 0, "length": 4096}}],
+  "region": {"start": "0xc9bc60610000", "perms": "r-xp", "size": 8192, "dumped": 4096, "kind": "anon",
+             "image": {"format": "ELF", "class": "ELF64", "byte_order": "little", "type": "ET_DYN",
+                       "machine": "aarch64", "build_id": "1424e4bd44113cdab5b83ceb70cd6c65a8c1d1e1",
+                       "build_id_at": 392}},
+  "inference": {"file": "…/crash_target", "source": "exe", "basis": "build-id",
+                "build_id": "1424e4bd44113cdab5b83ceb70cd6c65a8c1d1e1", "offset": 0,
+                "matched": 4096, "compared": 4096, "ratio": 1.0, "verified": true},
+  "tried": [{"path": "…/crash_target", "source": "exe", "matched": 4096, "compared": 4096, "ratio": 1.0,
+             "offset": 0, "page_aligned": true, "reached_floor": true, "verified": true,
+             "build_id": "1424e4bd44113cdab5b83ceb70cd6c65a8c1d1e1", "build_id_match": true,
+             "needle": {"at": 0, "length": 4096}}],
   "candidates": [{"path": "…/crash_target", "source": "exe"}],
   "probes": [{"at": 0, "bytes": 4096, "needles": [{"at": 0, "length": 4096}]}],
-  "reason": "this mapping is too small to check at a second offset, so this is a single-window match rather than a verified one"
+  "symbols": {"found": null, "searched": ["…/debuginfod_client/1424e4bd…/debuginfo",
+              "/usr/lib/debug/.build-id/14/24e4bd….debug"],
+              "why": "no file for build-id 1424e4bd… is in the debug trees this session was configured with; …"},
+  "reason": "this mapping's build-id is 1424e4bd…, and this file's is the same id: the same build, read out of the dump rather than inferred from it"
 }
 ```
 
@@ -282,6 +291,7 @@ The arithmetic, and why each rule is there — every one of them was a measured 
 | a second probe, half the mapping further on, has to agree too | one window can coincide; two offsets inside one mapping cannot. Reported as `verified`, and a mapping too small for two windows says *that* rather than claiming verification |
 | the derived offset must be **page-aligned** | a mapping starts on a page boundary — the kernel maps files that way — so an offset that says otherwise is a coincidence of bytes. This is what refuses a file whose content matches but whose layout cannot, and the reason says so in those words |
 | the dump being analysed is **never a candidate**, nor any other core | a core holds the region's own bytes, so it matches them perfectly: measured on the practice bundle, every region "matched" the core itself before this filter existed. `e_type == ET_CORE` is the test, and `candidate_files(exclude=…)` names the dump too |
+| a **build-id** match wins outright, over any resemblance | it is a record (`§3.3a`): the mapping and the file are the same build. Guards written for a resemblance — a second probe, a page-aligned derived offset — do not apply to it, and must not be allowed to veto it |
 | the candidate list is **bounded** (`MAX_CANDIDATES`) | the executable, the host files gdb found for the dump's objects, the names resolved under `sysroot` / `solib_search_path`, and the files beside them — in that order, deduplicated by real path. An answer about one mapping, not a filesystem scan |
 | a name is resolved under the sysroot **as gdb resolves it**, including the merged-`/usr` spelling | the core records `/lib/aarch64-linux-gnu/libc.so.6`, and on a Debian/Ubuntu system that file is `<sysroot>/usr/lib/aarch64-linux-gnu/libc.so.6`, because `/lib` is a symlink to `/usr/lib` there. Without the second spelling the one file that would name a whole region sits inside the sysroot the session was given and is never opened |
 
@@ -308,6 +318,46 @@ asserted over HTTP.
 In the GUI the answer is behind a click (`identify`, in the memory view's header, shown only for a mapping that
 has no name) and appears as a line under the header that starts with the word `inferred`; the region table marks
 the row the same way. Nothing is asked for in the background, and the mapping is not renamed.
+
+#### 3.3a The build-id comes first, because it is a record and the comparison is a resemblance
+
+Byte comparison is the weakest kind of answer this viewer gives, and the mature tools do not lean on it. Two
+things they do instead are both read straight out of the dump, and both are now here — they are why `basis` and
+`symbols` exist in the reply above.
+
+**An ELF image in a mapping.** A region whose first bytes are `\x7fELF` is an ELF image whatever the map calls
+it: an anonymous `r-xp` region holding one is the ordinary shape of a `dlopen`ed library, and also what an
+*injected* one looks like. `analysis/elfimage.py` reads the header (class, byte order, object type, machine
+through `analysis/elf.py`'s table, so one architecture has one name in this viewer) and, when the note is in
+reach, the build-id. This is `volatility3`'s `linux.elfs`, which scans VMAs for ELF magic and then *parses* the
+image with a real ELF parser before believing it. Measured: **5 of 28** regions of the practice core are images,
+and **4 of 113** of the 1.13 GB heavy core — one page per module, always the page that holds the file's header.
+The check is four bytes per region at load, so the whole map is annotated for free (`memory_map.regions[].image`).
+
+**The build-id.** `.note.gnu.build-id` names *this build* in twenty bytes, and it is in the dump because the
+file's first page is. LLDB does exactly this on an ELF core (commit `536abf8`, PR #92078 — *"in case of post
+mortem debugging, we don't always have the main executable available… the `.note.gnu.build-id` … should be
+available in the core file"*), and for the same reason: the id is the key a symbol server is queried with.
+Measured here: the practice core's libc mapping carries `27027b96e5b8c475fc327aa445bea1c71d37b4e2`, byte for
+byte the build-id of the `libc.so.6` in the sysroot that core was built against — and the x86-64 and i386
+fixtures, whose binaries this machine does not have at all, name five and five builds between them.
+
+That makes three answers available where there used to be one:
+
+| | |
+|---|---|
+| **the same build** → `basis: "build-id"` | the mapping's id equals a candidate's: the same build, exactly. It needs no second probe and no page-aligned derived offset, because those guard a *resemblance*; and it survives what a comparison cannot — measured on libc's rewritten `.data` page, where 4 693 of 8 192 bytes agree but the id settles it |
+| **a different build** → `build_id_match: false`, and the refusal says so | `this mapping is build 1424e4bd…, and no file compared here has that build-id (11 of them name one: libc.so.6=27027b96…, …)`. That is the question underneath every symbol the viewer shows — *is this library the one the dump ran?* — and gdb can only answer it with a warning (*"wrong library or version mismatch?"*) |
+| **neither** → the content comparison, as before | a mapping that is not an image, a file stripped of its note, or bytes that came from no file at all |
+
+**Where the file is.** `symbols` reports where the mapping's build-id was looked for and what was found: a
+**debug tree** (`<root>/<first two hex digits>/<rest>.debug`, the `debugedit`/`eu-unstrip` layout) and a
+**`debuginfod` client cache** (`<cache>/<id>/debuginfo`). Both are local conventions, both are configured —
+`CDWV_BUILD_ID_DIRS` (colon-separated, default `/usr/lib/debug/.build-id`) and `CDWV_DEBUGINFOD_CACHE` (default
+`~/.cache/debuginfod_client`). **Nothing is downloaded**: a viewer that silently reached for the network is doing
+something the user did not ask for, so an id with no file behind it is handed back with the command that would
+fetch it (`debuginfod-find debuginfo <id>`) — and `symbols.searched` lists every path that was opened, so "there
+is no such file here" and "nobody said where to look" are different answers.
 
 ---
 

@@ -84,8 +84,9 @@ def client(tmp_path_factory: pytest.TempPathFactory, unnamed: pathlib.Path):
 def test_a_mapping_is_identified_from_its_bytes(client) -> None:
     """The executable's own first page: the dump names no file for it, and the bytes say which file it is.
 
-    This is the case the whole feature exists for, and the numbers are checkable: the mapping holds the file's
-    first page (`offset 0x0`), and a page the loader never rewrote agrees byte for byte.
+    This is the case the whole feature exists for. The mapping is an ELF image, so the **build-id** it carries is
+    the answer and the content comparison is the confirmation — that order is what `basis` reports, and it is the
+    difference between a record and a resemblance.
     """
     test_client, session, summary = client
     regions = summary["memory_map"]["regions"]
@@ -103,16 +104,39 @@ def test_a_mapping_is_identified_from_its_bytes(client) -> None:
     assert found["inference"], found
     inference = found["inference"]
     assert inference["file"].endswith("/crash_target")
+    assert inference["basis"] == "build-id"
+    assert inference["build_id"] == program["image"]["build_id"], "the id the mapping carries, and the file's"
     assert inference["offset"] == 0, "the mapping holds the file's first page"
-    assert inference["matched"] == inference["compared"] > 0
+    assert inference["matched"] == inference["compared"] > 0, "and the bytes agree as well"
     assert inference["ratio"] == 1.0
+    # The reading travels with the answer, because it is the part of it that is a record.
+    assert found["region"]["image"]["class"] == "ELF64"
+    assert found["region"]["image"]["machine"] == "aarch64"
+    assert found["region"]["image"]["type"] == "ET_DYN"
     # The file is *not* written into the map: it is an inference, and the map goes on saying `anon`.
     assert found["region"]["start"] == program["start"] and "path" not in found["region"]
-    # Two honest sentences, and which one arrives depends on the mapping's size: a two-page mapping has no
-    # second offset to check against, so it is reported as a single-window match rather than as verified.
-    assert "inferred from content" in (found["reason"] or "") or "single-window" in (found["reason"] or ""), (
-        found["reason"]
+    assert "the same build" in (found["reason"] or ""), found["reason"]
+    # Every candidate is reported with its own build-id, so "which of these is the build the dump ran" is
+    # answerable for all of them rather than only for the winner.
+    assert found["tried"][0]["build_id_match"] is True
+    assert any(entry.get("build_id") and not entry["build_id_match"] for entry in found["tried"]), found["tried"]
+
+
+def test_a_build_id_is_looked_up_where_the_session_was_told_to_look(client) -> None:
+    """A build-id is exact, so it is worth looking up — and the reply says where it looked, and what it would
+    take to get the file. Nothing is downloaded: the id is handed to the caller instead."""
+    test_client, session, summary = client
+    libc = next(
+        region
+        for region in summary["memory_map"]["regions"]
+        if (region.get("image") or {}).get("build_id") and region["start"] != "0xc9bc60610000"
     )
+    build_id = libc["image"]["build_id"]
+    found = test_client.get(f"/api/sessions/{session}/identify", params={"address": libc["start"]}).json()
+    assert found["symbols"]["found"] is None, "this session was given no debug tree with that id in it"
+    assert build_id in found["symbols"]["why"]
+    assert "debuginfod-find debuginfo" in found["symbols"]["why"], "the way to the file is named, not taken"
+    assert any("debug/.build-id" in path or "debuginfod_client" in path for path in found["symbols"]["searched"])
 
 
 def test_the_answer_carries_what_it_compared_and_what_came_close(client) -> None:
@@ -138,6 +162,56 @@ def test_the_answer_carries_what_it_compared_and_what_came_close(client) -> None
     assert 0 < best["ratio"] < 1, f"a rewritten page agrees partly, not fully: {best}"
     if found["inference"] is None:
         assert str(best["matched"]) in (found["reason"] or ""), found["reason"]
+
+
+def test_a_debug_tree_the_session_was_given_is_where_the_build_is_found(
+    tmp_path_factory: pytest.TempPathFactory, unnamed: pathlib.Path
+) -> None:
+    """The positive half of the lookup: plant the id where a distribution keeps it, and the reply finds it.
+
+    `<root>/<first two hex digits>/<rest>.debug` is the `debugedit`/`eu-unstrip` layout, and it is the whole
+    reason a build-id is worth reading out of a dump: the core says which build it ran, the debug tree says where
+    that build's file is, and neither needs the machine the core came from.
+    """
+    libc_id = "27027b96e5b8c475fc327aa445bea1c71d37b4e2"  # the bundle's libc, measured from its core
+    tree = tmp_path_factory.mktemp("debug") / "build-id"
+    target = tree / libc_id[:2] / (libc_id[2:] + ".debug")
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"separate debug info")
+
+    app = create_app(
+        dataclasses.replace(
+            CONFIG,
+            gdb_path=str(GDB),
+            sysroot=str(BUNDLE / "sysroot"),
+            solib_search_path=str(BUNDLE),
+            build_id_dirs=(str(tree),),
+            debuginfod_cache=None,
+        ),
+        root=ROOT,
+        state_path=tmp_path_factory.mktemp("identify-state-2"),
+        bundle=BUNDLE,
+    )
+    with TestClient(app) as test_client:
+        created = test_client.post(
+            "/api/sessions",
+            json={"core": str(unnamed), "exe": str(BUNDLE / "crash_target"), "sysroot": str(BUNDLE / "sysroot"),
+                  "solib_search_path": str(BUNDLE)},
+        )
+        session = created.json()["id"]
+        loaded = test_client.get(f"/api/sessions/{session}", params={"wait": 60}).json()
+        assert loaded["state"] == "ready", loaded.get("error")
+        libc = next(
+            region
+            for region in loaded["summary"]["memory_map"]["regions"]
+            if (region.get("image") or {}).get("build_id") == libc_id
+        )
+        found = test_client.get(
+            f"/api/sessions/{session}/identify", params={"address": libc["start"]}
+        ).json()
+        assert found["symbols"]["found"]["path"] == str(target), found["symbols"]
+        assert "build-id tree" in found["symbols"]["found"]["source"]
+        assert str(target) in found["symbols"]["searched"]
 
 
 def test_a_mapping_in_no_file_says_that_instead_of_guessing(client) -> None:

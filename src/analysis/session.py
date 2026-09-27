@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from analysis import matching, report
+from analysis import elfimage, matching, report
 from analysis.gdb.base import GdbTimeout
 from config import CONFIG
 from schema import CONTRACT
@@ -300,6 +300,28 @@ class Session:
             answer = matching.identify(self.core, region, candidates)
             answer["address"] = key
             answer["candidates"] = candidates
+            # What the mapping *is*, when its bytes say (an ELF image, and which build) — and where that build's
+            # file is on this machine, if the session was told about a debug tree or a `debuginfod` cache.
+            # Nothing is downloaded: `symbols.searched` lists what was looked at, so "no such file here" and
+            # "nobody said where to look" arrive as different answers.
+            settings = self.settings()
+            build_id = (region.get("image") or {}).get("build_id")
+            answer["symbols"] = (
+                elfimage.resolve(
+                    build_id,
+                    dirs=getattr(settings, "build_id_dirs", ()) or (),
+                    caches=[settings.debuginfod_cache] if getattr(settings, "debuginfod_cache", None) else [],
+                )
+                if build_id
+                else {
+                    "found": None,
+                    "searched": [],
+                    "why": (
+                        "this mapping carries no build-id: its first bytes are not an ELF header, so there is "
+                        "nothing here that names a build"
+                    ),
+                }
+            )
             self._identified[key] = answer
             return answer
 

@@ -17,6 +17,9 @@ import pathlib
 
 from analysis import matching
 
+BUILD_ID_A = "1424e4bd44113cdab5b83ceb70cd6c65a8c1d1e1"
+BUILD_ID_B = "27027b96e5b8c475fc327aa445bea1c71d37b4e2"
+
 FILL = b"\x00" * 64
 
 
@@ -240,6 +243,61 @@ def test_a_sysroot_built_from_a_merged_usr_system_resolves_too(tmp_path: pathlib
     )
     assert [entry["source"] for entry in found] == ["sysroot + usr/lib/aarch64-linux-gnu/libc.so.6"]
     assert found[0]["path"].endswith("usr/lib/aarch64-linux-gnu/libc.so.6")
+
+
+# --- the build-id, which is a record rather than a resemblance ---------------------------- #
+def test_the_same_build_id_is_the_same_build_however_the_bytes_look(tmp_path: pathlib.Path, elf_image) -> None:
+    """Identity is not similarity: a rewritten page still carries the id of the build it came from.
+
+    The mapping holds the image's header and note — and then bytes that have been changed in memory, which is the
+    ordinary state of a `.data`, `.got` or RELRO page. The content comparison cannot reach its floor on that, and
+    the build-id settles the question anyway: same id, same build. This is what turns "4 693 of 8 192 bytes
+    agree" from a hint into an answer.
+    """
+    file_bytes = elf_image(BUILD_ID_A, body=blob(21, 8192))
+    library = tmp_path / "libbuild.so"
+    library.write_bytes(file_bytes)
+
+    page = bytearray(file_bytes[:4096])
+    for index in range(200, 4096, 16):  # rewritten after loading: relocated pointers, patched data
+        page[index : index + 16] = blob(index, 16)
+    core, region = core_file(tmp_path, [bytes(page)])
+
+    answer = matching.identify(core, region, [{"path": str(library), "source": "exe"}])
+    assert answer["inference"], answer
+    assert answer["inference"]["basis"] == "build-id"
+    assert answer["inference"]["file"] == str(library)
+    assert answer["inference"]["build_id"] == BUILD_ID_A
+    assert answer["tried"][0]["build_id_match"] is True
+    assert answer["region"]["image"]["build_id"] == BUILD_ID_A, "and the mapping's own reading travels with it"
+
+
+def test_a_different_build_is_reported_as_a_different_build(tmp_path: pathlib.Path, elf_image) -> None:
+    """The question a byte ratio only hints at: is this library the one the dump ran? The ids answer it."""
+    library = tmp_path / "libother.so"
+    library.write_bytes(elf_image(BUILD_ID_B, body=blob(22, 8192)))
+    core, region = core_file(tmp_path, [elf_image(BUILD_ID_A, body=blob(23, 8192))[:4096]])
+
+    answer = matching.identify(core, region, [{"path": str(library), "source": "sysroot"}])
+    assert answer["inference"] is None
+    assert answer["tried"][0]["build_id"] == BUILD_ID_B
+    assert answer["tried"][0]["build_id_match"] is False
+    assert "no file compared here has that build-id" in answer["reason"], answer["reason"]
+    assert BUILD_ID_A in answer["reason"] and "debuginfod-find" in answer["reason"], answer["reason"]
+
+
+def test_content_still_decides_when_there_is_no_build_id_to_compare(tmp_path: pathlib.Path, elf_image) -> None:
+    """A file stripped of its note, or a mapping that is not an image at all: the resemblance is what is left."""
+    image = elf_image(None, body=blob(24, 16384))  # a build with no `.note.gnu.build-id` in it
+    library = tmp_path / "libstripped.so"
+    library.write_bytes(image)
+    core, region = core_file(tmp_path, [image[0:8192], image[0x2000:0x4000]])
+
+    answer = matching.identify(core, region, [{"path": str(library), "source": "exe"}])
+    assert answer["inference"], answer
+    assert answer["inference"]["basis"] == "content"
+    assert answer["inference"]["verified"] is True
+    assert answer["tried"][0]["build_id"] is None
 
 
 def test_candidates_are_deduplicated_resolved_and_bounded(tmp_path: pathlib.Path) -> None:

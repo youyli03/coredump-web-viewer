@@ -246,9 +246,16 @@ class RegionIdentity(Permissive):
 
     address: str
     region: dict[str, Any]
+    """The mapping, with `image` when its bytes are an ELF header: the class, the machine, the object type and
+    the **build-id** — the one field here that is a record rather than a resemblance (`analysis/elfimage.py`)."""
     inference: dict[str, Any] | None = None
     """The file, the derived file offset of the mapping's first byte, and how many bytes agree there — at one
-    probe offset, and at a second one when the mapping is big enough for the claim to be checked."""
+    probe offset, and at a second one when the mapping is big enough for the claim to be checked. `basis` says
+    which of the two kinds of answer this is: `"build-id"` (the mapping and the file carry the same build-id:
+    the same build, exactly) or `"content"` (a resemblance, counted byte by byte)."""
+    symbols: dict[str, Any] | None = None
+    """Where the mapping's build-id was looked for on this machine, and what was found — a debug tree and a
+    `debuginfod` cache are the two layouts. Nothing is downloaded; `searched` names what was opened."""
     tried: list[dict[str, Any]]
     candidates: list[dict[str, Any]] | None = None
     """What was compared against, and why each file was on the list — the answer's own audit trail."""

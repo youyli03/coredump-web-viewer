@@ -25,6 +25,19 @@ def _env_str(name: str, default: str | None) -> str | None:
     return raw if raw else default
 
 
+def _env_paths(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """A colon-separated list of directories, in the same spelling `PATH` uses.
+
+    Empty and unset both mean the default, which is the one difference from `PATH`: an empty `CDWV_BUILD_ID_DIRS`
+    is not "look nowhere", it is a variable nobody set.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    parts = tuple(part for part in raw.split(":") if part)
+    return parts or default
+
+
 @dataclass(frozen=True)
 class Config:
     """Everything the backend needs to know about its environment."""
@@ -61,6 +74,16 @@ class Config:
     # is not under `src/`).
     ui_dir: str = "ui"
 
+    # Where a **build-id** is looked for, when a mapping's bytes carry one (`analysis/elfimage.py`). A core from
+    # another machine names its own libraries by paths that do not exist here, and gdb only manages to say
+    # *"wrong library or version mismatch?"* about a file that is not the one it wants; a build-id is exact, so
+    # the id read out of the dump is worth looking up. Both layouts are conventions, not inventions: a debug
+    # tree keeps files at `<root>/<first two hex digits>/<rest>.debug`, and a `debuginfod` client cache keeps
+    # them at `<cache>/<id>/debuginfo`. **Nothing is downloaded** — a viewer that silently reached for the
+    # network would be doing something the user did not ask for, and the id is in the reply anyway.
+    build_id_dirs: tuple[str, ...] = ("/usr/lib/debug/.build-id",)
+    debuginfod_cache: str | None = "~/.cache/debuginfod_client"
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -78,6 +101,8 @@ class Config:
             idle_reclaim_s=_env_float("CDWV_IDLE_RECLAIM_S", cls.idle_reclaim_s),
             max_sessions=int(_env_float("CDWV_MAX_SESSIONS", cls.max_sessions)),
             ui_dir=_env_str("CDWV_UI", cls.ui_dir) or cls.ui_dir,
+            build_id_dirs=_env_paths("CDWV_BUILD_ID_DIRS", cls.build_id_dirs),
+            debuginfod_cache=_env_str("CDWV_DEBUGINFOD_CACHE", cls.debuginfod_cache),
         )
 
 

@@ -4229,8 +4229,11 @@ async function identifyRegion(start) {
     const inference = reply.inference;
     logEvent(
       inference
-        ? `${window_label(start)}: same bytes as ${leaf(inference.file)} at file offset ${inference.offset}` +
-          `${inference.verified ? "" : " (one window only)"}`
+        ? `${window_label(start)}: ${inference.basis === "build-id" ? "same build-id as" : "same bytes as"} ` +
+          `${leaf(inference.file)}` +
+          (inference.basis === "build-id"
+            ? ` (${shortId(inference.build_id)})`
+            : ` at file offset ${inference.offset}${inference.verified ? "" : " (one window only)"}`)
         : `${window_label(start)}: nothing to identify — ${reply.reason}`,
     );
   } catch (error) {
@@ -4384,7 +4387,10 @@ function memoryView() {
     h("span", { class: "addr", text: state.address ?? "no address selected" }),
     h("span", {
       class: "dim",
-      text: region ? `· ${leaf(region.path) ?? `[${region.kind}]`} · ${region.perms} · ${bytes(region.size)}` : "· no mapping covers this address",
+      text: region
+        ? `· ${leaf(region.path) ?? `[${region.kind}]`} · ${region.perms} · ${bytes(region.size)}` +
+          (region.image?.build_id ? ` · build ${shortId(region.image.build_id)}` : "")
+        : "· no mapping covers this address",
     }),
     h("span", { class: "spacer" }),
     // Skipping the uninteresting rows. A stack window is 132 KB of which the frames are 5 KB, so "next
@@ -4606,6 +4612,19 @@ function memoryView() {
                         "inferred",
                       )
                     : null,
+                  // And the mapping's own reading, when its bytes are an ELF image: not a name for the mapping,
+                  // but the fact that names the *build* — which is exact, and which no amount of byte comparison
+                  // can be.
+                  item.image?.build_id
+                    ? h(
+                        "span",
+                        {
+                          class: "src",
+                          title: `${item.image.class} ${item.image.type} ${item.image.machine}, build-id ${item.image.build_id}`,
+                        },
+                        `elf ${shortId(item.image.build_id)}`,
+                      )
+                    : null,
                 ),
               ),
             ),
@@ -4635,17 +4654,39 @@ function identifyNote(region) {
       h("span", { class: "dim", text: ` ${answer.reason}` }),
     );
   }
-  const second = inference.verified
-    ? `, and again ${inference.verified_matched} of ${inference.verified_compared} at +${inference.verified_offset}`
-    : ", one window only — this mapping is too small for a second one";
+  // Two kinds of answer, and the difference is the whole point: a build-id match is a record the mapping
+  // carries, a content match is a resemblance counted byte by byte.
+  const recorded = inference.basis === "build-id";
+  const evidence = recorded
+    ? `the same build-id ${shortId(inference.build_id)}` +
+      (inference.matched ? `, and ${inference.matched} of ${inference.compared} bytes agree as well` : "")
+    : `${inference.matched} of ${inference.compared} bytes agree` +
+      (inference.verified
+        ? `, and again ${inference.verified_matched} of ${inference.verified_compared} at +${inference.verified_offset}`
+        : ", one window only — this mapping is too small for a second one");
+  const where = answer.symbols?.found
+    ? { text: ` · its symbols: ${answer.symbols.found.path}`, cls: "" }
+    : answer.symbols?.searched?.length
+      // The whole id, not the short form: this text is a command someone will paste, and half a build-id
+      // fetches nothing.
+      ? { text: ` · no debug file for this build here (debuginfod-find debuginfo ${inference.build_id})`, cls: "dim" }
+      : null;
   return h(
     "div",
     { class: "identify-note" },
-    h("span", { class: "tag on", text: "inferred" }),
-    h("span", { text: ` ${leaf(inference.file)} at file offset ${inference.offset}` }),
-    h("span", { class: "dim", text: ` · ${inference.matched} of ${inference.compared} bytes agree${second}` }),
-    h("span", { class: "dim", text: " · from content, not from this dump: the mapping keeps its name" }),
+    h("span", { class: "tag on", text: recorded ? "same build-id" : "inferred" }),
+    h("span", { text: ` ${leaf(inference.file)}${inference.offset !== null ? ` at file offset ${inference.offset}` : ""}` }),
+    h("span", { class: "dim", text: ` · ${evidence}` }),
+    where ? h("span", { class: where.cls || "dim", text: where.text }) : null,
+    h("span", { class: "dim", text: " · not written into the dump's map: the mapping keeps its name" }),
   );
+}
+
+// A build-id is 40 hex characters and means nothing to read: the first eight identify it, and the whole thing
+// travels in the element's title so it can be copied.
+function shortId(id, length = 8) {
+  if (!id) return "—";
+  return id.slice(0, length);
 }
 
 // What gdb knows about this dump's objects and could not place. It is the answer to "why is this region still
