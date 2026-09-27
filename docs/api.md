@@ -45,7 +45,8 @@ turns one of §13's acceptance items into data.
 
 `GET /api/health` · `GET /api/samples` · `GET /api/defaults` · `GET /api/recent` ·
 `DELETE /api/recent/{index}` · `POST /api/sessions` · `GET /api/sessions/{id}` · `POST /api/sessions/{id}/reload` · `DELETE /api/sessions/{id}` ·
-`GET /api/sessions/{id}/memory` · `…/disassemble` · `…/object` · `…/objects` · `…/stack` · `…/frames/{level}`
+`GET /api/sessions/{id}/memory` · `…/disassemble` · `…/identify` · `…/object` · `…/objects` · `…/stack` ·
+`…/frames/{level}`
 
 Two endpoints in §5 and §6 are now in the tree and are **not** part of that list: `…/sessions/{id}?wait=<n>`
 and `DELETE /api/sessions`. §8 records what else has landed.
@@ -54,7 +55,7 @@ and `DELETE /api/sessions`. §8 records what else has landed.
 |---|---|
 | `health` `samples` `defaults` `recent` | good — pure reads, no core, no gdb: they are the smoke layer |
 | `POST /sessions`, `GET /sessions/{id}`, `DELETE` | workable — but loading is asynchronous, so a test can only poll and hope; and every open **writes the checkout's own `.coredump-viewer.json`** |
-| `…/memory`, `…/disassemble`, `…/object`, `…/objects`, `…/stack`, `…/frames/{level}` | correct answers, no cost observable — nothing reports how many gdb commands a request sent, or whether it was answered from cache |
+| `…/memory`, `…/disassemble`, `…/identify`, `…/object`, `…/objects`, `…/stack`, `…/frames/{level}` | correct answers, no cost observable — nothing reports how many gdb commands a request sent, or whether it was answered from cache |
 
 ### 2.1 What is missing, with the evidence
 
@@ -185,8 +186,8 @@ the file it found for it is one it rejects. So a caller asking "which region is 
 
 What this does **not** do is guess: a library that gdb could not place, or placed from a file it rejected, names
 nothing, and the region stays `anon` with gdb's own warning in `session.warnings`. Identifying a region by its
-**content** — matching its bytes against the files this session was given — is a separate and explicit
-inference, and it is what covers the case gdb cannot: a module whose file gdb never found.
+**content** — matching its bytes against the files this session was given — is the third and last source, a
+separate and explicit inference that covers the case gdb cannot: §3.3.
 
 ### 3.2 The memory window: what is there, what is not, and what was never asked about
 
@@ -239,6 +240,73 @@ it as data (`memory.missing`), and `ui/app.js` turns the refusal into an `unread
 The 422 keeps "the request could not be honoured" visible to anything that is not that one caller. If it is
 ever changed to 200, the body should keep `unread` and the same reason text, so the frontend branch that
 already exists keeps working.
+
+### 3.3 Identifying a mapping by its content — an inference, and the only one
+
+`GET /api/sessions/{id}/identify?address=0x…` answers the question the two naming sources can leave open: *which
+file are these bytes from?* The core's `NT_FILE` note is the kernel's record and gdb's library list is a
+reconstruction from the link map (§3.1a); when neither names a mapping — and neither knows anything about a
+mapping whose file is not reachable from this session — the bytes themselves are the last evidence there is.
+
+It answers for a mapping the dump *did* name as well, and that is not a contradiction: it is how a reader checks
+that the binary they have is the one this dump came from, which is the question underneath every symbol the
+viewer shows. (`tests/api/test_identify.py` uses it in both directions — a mapping nothing names, and a near
+miss on libc's rewritten page.)
+
+It is a different kind of answer and the contract says so. **Nothing is written into the memory map**: the
+region keeps its `path: null`, its `kind: anon` and its `source: null`, and the reply is an *inference* with its
+own arithmetic:
+
+```json
+{
+  "address": "0xc9bc60610000",
+  "region": {"start": "0xc9bc60610000", "perms": "r-xp", "size": 8192, "dumped": 4096, "kind": "anon"},
+  "inference": {"file": "…/crash_target", "offset": 0, "matched": 4096, "compared": 4096, "ratio": 1.0,
+                "verified": false, "verified_offset": null},
+  "tried": [{"path": "…/crash_target", "matched": 4096, "compared": 4096, "ratio": 1.0, "offset": 0,
+             "page_aligned": true, "reached_floor": true, "needle": {"at": 0, "length": 4096}}],
+  "candidates": [{"path": "…/crash_target", "source": "exe"}],
+  "probes": [{"at": 0, "bytes": 4096, "needles": [{"at": 0, "length": 4096}]}],
+  "reason": "this mapping is too small to check at a second offset, so this is a single-window match rather than a verified one"
+}
+```
+
+The arithmetic, and why each rule is there — every one of them was a measured failure first:
+
+| rule | why |
+|---|---|
+| a probe is read **from the core file**, never through gdb | the bytes are in the dump; a debugger round trip would cost more than the answer. Reading stops at `p_filesz` (the region's `dumped`), because a core holds what was resident and the rest of the mapping is not in the file |
+| the needle is the **whole probe with fill bytes trimmed off the ends** | the first version was "the longest run of non-zero bytes", and measured on the practice core's own executable mapping it found nothing: a binary's first page begins with an ELF header, whose non-zero runs are two and four bytes long. Internal zeros are kept — an 8 KB window matches a file only if that file holds the same bytes in the same place |
+| the whole window is tried first, then its **longest runs** (up to `MAX_NEEDLES`) | a `r--p` mapping is very often **RELRO** — pointers the loader rewrote after mapping the file — so the window is no longer in it. Measured on this core's libc: the window is in no file, and the runs the loader did not touch are. Six needles and not three, because on a half-rewritten page the three longest runs all straddled the rewrite |
+| `matched / compared >= 0.75` (`MATCH_FLOOR`) before an offset is a match at all | a living process's `.data` and `.got` have been rewritten. Measured: libc's `rw-p` mapping agrees with the file on **4 693 of 8 192** bytes, which is evidence and not a match |
+| a second probe, half the mapping further on, has to agree too | one window can coincide; two offsets inside one mapping cannot. Reported as `verified`, and a mapping too small for two windows says *that* rather than claiming verification |
+| the derived offset must be **page-aligned** | a mapping starts on a page boundary — the kernel maps files that way — so an offset that says otherwise is a coincidence of bytes. This is what refuses a file whose content matches but whose layout cannot, and the reason says so in those words |
+| the dump being analysed is **never a candidate**, nor any other core | a core holds the region's own bytes, so it matches them perfectly: measured on the practice bundle, every region "matched" the core itself before this filter existed. `e_type == ET_CORE` is the test, and `candidate_files(exclude=…)` names the dump too |
+| the candidate list is **bounded** (`MAX_CANDIDATES`) | the executable, the host files gdb found for the dump's objects, the names resolved under `sysroot` / `solib_search_path`, and the files beside them — in that order, deduplicated by real path. An answer about one mapping, not a filesystem scan |
+
+**A near miss is the useful half of "no match".** When nothing reaches the floor the reply still carries
+`tried`, every candidate with its own numbers, and the reason names the closest one —
+
+```text
+no file this session was given holds these bytes unchanged: the closest is libc.so.6, where 4693 of 8192
+bytes agree at file offset 0x1a0000 — 75% has to agree, because pages the loader rewrote (relocations,
+`.got`, RELRO) are no longer the file's bytes
+```
+
+— because that is what tells a reader whether this dump came from the library they think it did. Three other
+kinds of nothing are distinguishable and say which they are: the mapping is all zeros (an unused stack: *"of
+the 0 bytes in these pages that are not zeros or fill, none is a run of the 64 needed"*), the dump holds no
+bytes for it at all, and the session was given no file to compare against (with the way out named: `exe`,
+`sysroot`, `solib_search_path`). An address in no mapping is `404`, and the refusal names the map's extent.
+
+**Cost**: 0 gdb commands — it is file reading, not the debugger — one pass over each candidate per needle, and
+the answer is cached per session and per address. Measured on the practice core with its note patched out: 10
+candidates, **0.06 s for every region in the map**, and a repeat request costs nothing. `X-Gdb-Commands: 0` is
+asserted over HTTP.
+
+In the GUI the answer is behind a click (`identify`, in the memory view's header, shown only for a mapping that
+has no name) and appears as a line under the header that starts with the word `inferred`; the region table marks
+the row the same way. Nothing is asked for in the background, and the mapping is not renamed.
 
 ---
 
@@ -331,6 +399,7 @@ exactly 1). The frame **locations** for a whole window are now asked for in one 
 | `POST …/expand {address, type, field?, follow?}` | one level: `*(struct node *)0x…` → five fields, each carrying the expression that expands *it*; `follow` gives the `parent->next` step; a type or field that is not shaped like one is 400, because the API composes the expression and never hands a caller's string to gdb |
 | `GET …/symbolize?address` | the mapping, the enclosing function with the offset into it, and — for a stack address — the thread whose stack pointer is inside that mapping. A heap address answers "no function contains this", a stack address answers with the thread, and the deliberate stray pointer answers three absences with three reasons |
 | `GET …/capabilities` | §13.6, the same bits the summary carries (asserted equal), including the note that says why something is false |
+| `…/identify` | what file an anonymous mapping's bytes came from: `200` with the inference and its arithmetic, `404` for an address in no mapping (naming the map's extent), and **0 gdb commands** — it reads candidate files, not the dump. The one answer in this API that is an inference rather than a record (§3.3) |
 | `POST …/reload` | reads the **same core again** in a new session: `201` with the new id, the new session is whole (poll it the same way), and the one it replaced is evicted by capacity — measured on the practice core, 0.9 s end to end. The paths are the *session's* own, not the caller's and not the summary's: the summary reports a display path (relative to this checkout when it can be), and re-opening from a string that was only meant to be read is how a viewer ends up analysing a file nobody named. A session that **failed** to load reloads too — that is when a reader most wants another try — so the endpoint needs `404`-able existence, not readiness |
 
 Each of these is *thin by rule* (§5 of architecture: a route that computes anything has put logic in the wrong

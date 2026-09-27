@@ -219,7 +219,9 @@ table.regions .anon { color: var(--anon); font-style: italic; }
    it is instead of presenting both as the same kind of fact. */
 table.regions .src { color: var(--dim); font-size: 10.5px; margin-left: 6px; }
 table.regions .src.mismatch { color: var(--exec); }
-table.regions caption { caption-side: bottom; text-align: left; color: var(--dim); font-size: 11.5px; padding-top: 8px; }
+/* Above the table and not below it: this note is about *why* the rows below are anonymous, and a note under a
+   28-row table is one nobody reads. */
+table.regions caption { caption-side: top; text-align: left; color: var(--dim); font-size: 11.5px; padding: 0 0 8px; }
 
 /* ---------- memory: hex editor on the left, meaning on the right ---------- */
 .view.memview { display: grid; grid-template-rows: auto auto auto 1fr; overflow: hidden; padding: 10px 14px 0; }
@@ -410,6 +412,21 @@ button.scell.field.leads:hover { outline: 1px solid rgba(var(--tint), .9); }
 }
 .legend-item { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; white-space: nowrap; }
 .legend-swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; background: rgba(var(--tint), .55); }
+/* The one inferred line on the memory screen: which file a mapping's bytes came from. It sits directly under the
+   header, where the mapping's name is, because that is the claim it is about — and it is marked as an inference
+   rather than reading like the region's name, which the dump simply does not have. */
+.identify-note {
+  display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap;
+  padding: 4px 10px 6px; font-family: var(--mono); font-size: 11.5px;
+  border-bottom: 1px solid var(--line);
+}
+.identify-note .tag {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; color: var(--dim);
+}
+.identify-note .tag.on { color: var(--read); border-color: rgba(127, 209, 139, .5); }
+.identify-note .dim { color: var(--dim); }
+
 /* The field rail: the complete field list, beside the bytes. Values wrap rather than clip — the whole point
    of the rail is that the overlay's labels do not fit between two byte columns. */
 .srail { overflow: auto; min-height: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 6px 0 24px; }

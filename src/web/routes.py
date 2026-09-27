@@ -31,6 +31,7 @@ from schema import (
     OpenSession,
     ProcessStats,
     Registers,
+    RegionIdentity,
     SessionStats,
     Symbolized,
     RecentEntry,
@@ -435,6 +436,31 @@ def disassemble_page(session_id: str, request: Request, address: str) -> dict:
         bundle=session.solib_search_path,
         sysroot=session.sysroot,
     )
+
+
+@router.get("/sessions/{session_id}/identify", response_model=RegionIdentity)
+def identify_region(session_id: str, request: Request, address: str) -> dict:
+    """Which file the mapping at this address came from, by its **content** — an inference, and it says so.
+
+    The last of three naming sources, and the only one that guesses: the core's `NT_FILE` note is the kernel's
+    record (region `source: "nt_file"`), gdb's library list is a reconstruction from the link map
+    (`source: "gdb"`), and when neither can name a mapping this compares the bytes the dump holds against the
+    files *this session was given*. It is on demand because it is the only one that reads files other than the
+    core, and it is bounded: the executable, the files gdb found, and the names under `sysroot` /
+    `solib_search_path`, at most `matching.MAX_CANDIDATES` of them.
+
+    The reply never becomes a region name. `inference` carries the file, the derived file offset and how many
+    of the compared bytes agree, at **two** offsets inside the mapping, and `tried` carries every candidate with
+    its own numbers — including the near misses a reader needs when nothing matches (`no file… the closest is
+    libc.so.6, where 4 693 of 8 192 bytes agree`, which is what a page the loader rewrote looks like). A
+    mapping of zeros, or one in no file at all, says that instead.
+    """
+    session = _ready(request, session_id)
+    _with_summary(session)
+    try:
+        return session.identify(int(address, 16))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/sessions/{session_id}/object", response_model=TypedObject)

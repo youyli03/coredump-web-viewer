@@ -47,6 +47,8 @@ const state = {
   typedData: {}, // typed objects fetched for what is on screen, by expression
   objectPages: {}, // window ranges whose objects have been asked for
   objectAsked: {}, // addresses whose object has been asked for
+  identified: {}, // region start → what content matching made of that mapping (the *only* inferred answer)
+  identifyPending: null, // the region start whose request is in flight
   stackPending: false, // one request, however many renders happen while it is in flight
   instruction: null, // the selected instruction: the bytes, its chip and its rail line are one thing
   sample: null, // which sample the data on screen came from — the chip that is lit reads this, nothing else
@@ -4212,6 +4214,32 @@ async function ensureObjects(address, length) {
   state.objectPending = false;
 }
 
+// Which file an anonymous mapping's bytes came from — the last resort, and the only *inferred* answer on this
+// screen. Asked for, never guessed at in the background: it reads files other than the core, and the reply is
+// evidence rather than a name, so it belongs behind a click that says so.
+async function identifyRegion(start) {
+  if (!state.live || state.identifyPending) return;
+  state.identifyPending = start;
+  render();
+  try {
+    const response = await fetch(`/api/sessions/${state.live.id}/identify?address=${start}`);
+    const reply = await response.json();
+    if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
+    state.identified[start] = reply;
+    const inference = reply.inference;
+    logEvent(
+      inference
+        ? `${window_label(start)}: same bytes as ${leaf(inference.file)} at file offset ${inference.offset}` +
+          `${inference.verified ? "" : " (one window only)"}`
+        : `${window_label(start)}: nothing to identify — ${reply.reason}`,
+    );
+  } catch (error) {
+    state.identified[start] = { error: String(error.message ?? error) };
+  }
+  state.identifyPending = null;
+  render();
+}
+
 // One object, for the rail: the typed tree is a lookup by address, so that is the question to ask.
 async function ensureObject(address) {
   if (!state.live) return;
@@ -4389,6 +4417,17 @@ function memoryView() {
         if (pc) goTo(pc);
       },
     }),
+    // Only where the dump leaves a question open: a mapping nothing named. Nothing is asked for in the
+    // background — the answer compares this dump's bytes against files on this machine, and the button is how
+    // the reader asks for that rather than having it done silently.
+    state.live && region && !region.path
+      ? h("button", {
+          class: `twisty ${state.identified[region.start] ? "active" : ""}`,
+          text: state.identifyPending === region.start ? "identifying…" : "identify",
+          title: "compare this mapping's bytes with the files this session was given, and say which file they come from",
+          onclick: () => identifyRegion(region.start),
+        })
+      : null,
     windows.map((window, index) =>
       h("button", {
         class: `twisty ${shown === window ? "active" : ""}`,
@@ -4505,6 +4544,7 @@ function memoryView() {
     "div",
     { class: "view memview" },
     header,
+    identifyNote(region),
     strip,
     legend,
     state.mappings
@@ -4554,12 +4594,57 @@ function memoryView() {
                         "gdb",
                       )
                     : null,
+                  // And the one that was identified by its content: a weaker claim than either source above, so it
+                  // is marked as an inference and the mapping keeps saying `[anon]` beside it.
+                  state.identified[item.start]?.inference
+                    ? h(
+                        "span",
+                        {
+                          class: "src",
+                          title: "identified by comparing these bytes with the files this session was given",
+                        },
+                        "inferred",
+                      )
+                    : null,
                 ),
               ),
             ),
           ),
         )
       : body,
+  );
+}
+
+// What content matching made of the mapping in view, once it has been asked for. It is the one line on this
+// screen that is an *inference*, so it says so in the first word and carries its own evidence: which file, at
+// which file offset of the region's first byte, how many bytes agree, and whether a second window in the same
+// mapping agreed too. It never renames the region — the map keeps saying `[anon]`, because the dump does.
+function identifyNote(region) {
+  if (!region || !state.live) return null;
+  const answer = state.identified[region.start];
+  if (!answer) return null;
+  if (answer.error) {
+    return h("div", { class: "identify-note" }, h("span", { class: "dim", text: `could not identify: ${answer.error}` }));
+  }
+  const inference = answer.inference;
+  if (!inference) {
+    return h(
+      "div",
+      { class: "identify-note" },
+      h("span", { class: "tag", text: "not identified" }),
+      h("span", { class: "dim", text: ` ${answer.reason}` }),
+    );
+  }
+  const second = inference.verified
+    ? `, and again ${inference.verified_matched} of ${inference.verified_compared} at +${inference.verified_offset}`
+    : ", one window only — this mapping is too small for a second one";
+  return h(
+    "div",
+    { class: "identify-note" },
+    h("span", { class: "tag on", text: "inferred" }),
+    h("span", { text: ` ${leaf(inference.file)} at file offset ${inference.offset}` }),
+    h("span", { class: "dim", text: ` · ${inference.matched} of ${inference.compared} bytes agree${second}` }),
+    h("span", { class: "dim", text: " · from content, not from this dump: the mapping keeps its name" }),
   );
 }
 
@@ -5282,6 +5367,8 @@ function installReport(data, { origin, sample = null }) {
   state.typedData = {};
   state.objectPages = {};
   state.objectAsked = {};
+  state.identified = {};
+  state.identifyPending = null;
   state.stackPending = false;
   state.stackRefused = null;
   state.ui = "ready";

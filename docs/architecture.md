@@ -71,15 +71,17 @@ what a given binary can actually do. So the transport layer is a small class hie
 
 ```text
 Transport (abstract)      threads · backtrace · frame_arguments · frame_variables · registers ·
-                          stack_frames · frame_slots · memory_map · read_memory · disassemble ·
-                          evaluate · expand · symbolize · capabilities
+                          stack_frames · frame_slots · memory_map · libraries · read_memory ·
+                          disassemble · evaluate · expand · symbolize · capabilities
 ├── EmbeddedTransport     ① a payload runs inside gdb (needs Python in that gdb build)
 └── MiTransport           ② structured records over --interpreter=mi3/mi2/mi
 ```
 
 **Status:** `MiTransport` is implemented and tested against a real aarch64 core — threads, backtrace,
 frame arguments and locals, registers, `read_memory` (holes preserved), `disassemble` (C6), the typed walk
-(`evaluate` / `expand`), and the stack as memory (`stack_frames` / `frame_slots`). `EmbeddedTransport` is
+(`evaluate` / `expand`), the stack as memory (`stack_frames` / `frame_slots`), and the dump's shared objects
+(`libraries`, which is gdb's answer to "which files did this core have" — including the ones it can name and
+cannot place). `EmbeddedTransport` is
 **deferred**: every gdb on the development machine is `--without-python`, so it could not be developed
 against reality. The board's two gdbs *do* have Python, so it becomes testable there once the runner can
 spawn gdb over ssh.
@@ -230,6 +232,8 @@ Four gates, and two of them are the ones that bite:
 | **stack slots** (`frame_slots`) | on demand, one frame per click | which bytes of the stack window each variable occupies |
 | **code** (disassemble) | on demand, **one window per scroll**, cached by range | the instructions beside the bytes on screen |
 | memory map (segments: range, permissions, size, source file) | load (once) | summary → memory view |
+| **the dump's shared objects** (`libraries`) | load (once), **one command** | the *second* naming source for the map: a region is named from it when the core's own `NT_FILE` note named nothing (`docs/api.md` §3.1a) |
+| **identifying a mapping by its content** | on demand, **one click**, and **0 gdb commands** | which file an anonymous mapping's bytes came from — an inference, and the only one (`docs/api.md` §3.3) |
 | capabilities (what this dump can and cannot show) | load (once) | drives which panels are shown/disabled |
 | another thread's stack | on demand | stack flow graph |
 | registers of a frame | on demand | frame detail |

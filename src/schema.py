@@ -230,6 +230,32 @@ class MemoryWindow(Permissive):
     refused: dict[str, str] | None = None
 
 
+class RegionIdentity(Permissive):
+    """Which file a mapping's bytes came from, by content — the one naming path that is an **inference**.
+
+    The core's `NT_FILE` note is the kernel's record and gdb's library list is a reconstruction
+    (`docs/api.md` §3.1a); both can be empty, and neither knows anything about a mapping whose file is not
+    reachable from the session. This is what is left, and it is deliberately not the same kind of answer: the
+    region keeps saying `anon`, and every number behind the claim travels with it.
+
+    `inference` is `null` when nothing matched, and `reason` says which kind of nothing it was — no candidate
+    held these bytes, the closest held only some of them, the mapping is all zeros, or the session was given no
+    file to compare against. `tried` carries every candidate with its own score, so a caller can see the near
+    misses rather than only the conclusion.
+    """
+
+    address: str
+    region: dict[str, Any]
+    inference: dict[str, Any] | None = None
+    """The file, the derived file offset of the mapping's first byte, and how many bytes agree there — at one
+    probe offset, and at a second one when the mapping is big enough for the claim to be checked."""
+    tried: list[dict[str, Any]]
+    candidates: list[dict[str, Any]] | None = None
+    """What was compared against, and why each file was on the list — the answer's own audit trail."""
+    probes: list[dict[str, Any]] | None = None
+    reason: str | None = None
+
+
 class FrameVariable(Permissive):
     name: str
     type: str | None = None

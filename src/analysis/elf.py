@@ -100,6 +100,10 @@ def memory_map(
     region records which source named it, `"nt_file"` or `"gdb"`, because the two are worth different amounts
     of trust: one is the kernel's own record written into the dump, the other is gdb's reconstruction from the
     link map, and a region neither source knows stays `anon`.
+
+    `dumped` is how many bytes of the region the dump actually **holds** (`p_filesz`), which is not `size`
+    (`p_memsz`): a core writes what was resident, so a mapping can be mostly holes. Anything reading a region
+    out of the core file itself has to stop there, and `analysis/matching.py` does.
     """
     from elftools.elf.elffile import ELFFile
 
@@ -130,6 +134,7 @@ def memory_map(
                     "start": hex(start),
                     "end": hex(end),
                     "size": size,
+                    "dumped": min(int(segment["p_filesz"]), size),
                     "perms": _perms(int(segment["p_flags"])),
                     "offset": int(segment["p_offset"]),
                     "path": path,
