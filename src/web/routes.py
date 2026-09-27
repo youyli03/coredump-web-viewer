@@ -412,22 +412,41 @@ def disassemble_page(session_id: str, request: Request, address: str) -> dict:
 
 @router.get("/sessions/{session_id}/object", response_model=TypedObject)
 def object_at(session_id: str, request: Request, address: str) -> dict:
-    """The typed object known at an address — a lookup in the index the summary already carries."""
+    """The typed object known at an address — a lookup in the session's own index.
+
+    The index is the crashed frame's arguments walked one level at a time (`Session.typed_index`), so a heap
+    address answers with the object whose fields sit there, and an address nothing was walked to answers 404
+    with the way out: `POST /expand`, naming the type. What it must **not** do is answer with a type nobody
+    asked about — a C dump has no runtime types, and a viewer that invents one is worse than one that says
+    "ask me with a type and I will read it".
+
+    A dump whose capability says `typed: false` gets `501` rather than `404`: nothing can be looked up because
+    nothing can be typed, and those are different sentences — `requirements.md` §13.6 asks for an absent
+    capability to be *stated*, and `[]` or "not found" would leave the reader guessing which one they hit.
+    """
     session = _require(request, session_id)
     summary = _with_summary(session)
     from analysis import queries
 
-    if not (summary.get("typed") or {}).get("objects"):
-        # Said plainly, because the alternative is a 404 that reads like a typing mistake. The live summary is
-        # built without the typed index (it is the demo profile that pre-fetches it), so "what type is at this
-        # address" has no answer to give here — and `POST /expand` is the way to ask with a type named.
+    _typed_or_501(summary)
+    index = session.typed_index()
+    found = queries.object_at(index, int(address, 16))
+    if found is None:
+        # One refusal for both ways of missing — "the index is empty" and "the index does not reach here" —
+        # because the reader's next move is the same either way, and naming it is the difference between a
+        # refusal they can act on and one that reads like a typing mistake. What the index *is* comes from the
+        # session: the expressions it was walked from, or the fact that the dump gave the frame none.
+        roots = session.typed_roots()
+        walked = (
+            f"the index holds what the crashed frame's arguments reach ({', '.join(roots)})"
+            if roots
+            else "this dump gave the crashed frame no typed arguments to walk from"
+        )
         raise HTTPException(
             status_code=404,
-            detail="this session holds no typed index: name the type instead (POST /expand)",
+            detail=f"no type is known for {address}: {walked}. Name the type instead (POST /expand), which is "
+            "the 'interpret as…' picker of requirements.md §4 rather than guessed DWARF",
         )
-    found = queries.object_at(summary, int(address, 16))
-    if found is None:
-        raise HTTPException(status_code=404, detail=f"no type is known for {address}")
     return found
 
 
@@ -556,8 +575,13 @@ def symbolize(session_id: str, request: Request, address: str) -> dict:
 
 @router.get("/sessions/{session_id}/objects", response_model=list[TypedObject])
 def objects_in(session_id: str, request: Request, address: str, length: int = 4096) -> list:
-    """The typed objects overlapping a range — what the overlay on those bytes needs."""
+    """The typed objects overlapping a range — what the overlay on those bytes needs.
 
+    The **first** call to this endpoint on a live session is the one that walks the index (bounded: 80 objects,
+    5 levels, 16 children a level), and every call after it is a lookup — so a scroll is free and the walk is
+    paid once. What the walk starts from is the crashed frame's arguments, and only those: a pointer argument
+    says where to look and what shape to expect, which is the one typed root a core has without a scan.
+    """
     session = _require(request, session_id)
     summary = _with_summary(session)
     limit = _config(request).max_limit
@@ -565,7 +589,24 @@ def objects_in(session_id: str, request: Request, address: str, length: int = 40
         raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
     from analysis import queries
 
-    return queries.objects_in(summary, int(address, 16), length)
+    _typed_or_501(summary)
+    return queries.objects_in(session.typed_index(), int(address, 16), length)
+
+
+def _typed_or_501(summary: dict) -> None:
+    """Refuse with `501` when this dump cannot be typed at all, quoting the capability's own note.
+
+    `requirements.md` §13.6: a capability that is absent is *stated*. An index over a dump with no DWARF is not
+    an empty index — it is an index that cannot exist — and the two must not arrive at the reader as the same
+    empty list. The note is the one the capability probe wrote, because it is gdb's own account of why.
+    """
+    capabilities = (summary.get("session") or {}).get("capabilities") or {}
+    if capabilities.get("dwarf_types") is False:
+        raise HTTPException(
+            status_code=501,
+            detail=(capabilities.get("notes") or {}).get("dwarf_types")
+            or "this dump carries no DWARF type information, so nothing here can be typed",
+        )
 
 
 @router.get("/sessions/{session_id}/frames/{level}", response_model=list[FrameVariable])

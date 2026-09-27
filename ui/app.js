@@ -3100,6 +3100,9 @@ function fieldRail(target, region) {
       "aside",
       { class: "srail" },
       h("div", { class: "rail-empty dim", text: "no type is known for this address — the bytes are all this dump has to say about it" }),
+      // Which is exactly where the plain word-by-word reading earns its place: `requirements.md` C3 asks for
+      // the DWARF fields when a type is known there and *this* when it is not.
+      rawSection(target),
       ownerSection(region, target),
     );
   }
@@ -3150,6 +3153,7 @@ function fieldRail(target, region) {
       ...railRows(object, 1, new Set(), railRootAddress(object)),
       h("div", { class: "brace", style: railIndent(0) }, h("span", { text: "}" })),
     ),
+    rawSection(target),
     ownerSection(region, target),
     elsewhereSection(object.elsewhere),
   );
@@ -3189,9 +3193,37 @@ function elsewhereSection(away) {
   );
 }
 
+// The window's own shape, from the core's ELF header through the API (`/memory` carries it). Absolute rather
+// than guessed: a word read in the wrong byte order is a wrong number that looks exactly like a right one, and
+// this page has no business knowing what it is running on — the core may be neither little-endian nor 64-bit.
+function windowOrder(window) {
+  return window?.byte_order ?? state.data.memory_map?.byte_order ?? null;
+}
+
+function windowArch(window) {
+  return window?.arch ?? state.data.memory_map?.arch ?? null;
+}
+
+// `size` bytes at `target`, in `order`, or null when any of them is not in the window at all.
+//
+// BigInt, not Number: a 64-bit word does not survive a JavaScript number, and an address that comes back
+// rounded is worse than one that comes back as `—`. The byte order decides which end the first byte is.
+function readWord(map, target, size, order) {
+  let value = 0n;
+  for (let index = 0; index < size; index += 1) {
+    const byte = map.get((target + BigInt(index)).toString());
+    if (byte === undefined) return null;
+    const shift = order === "big" ? size - 1 - index : index;
+    value |= BigInt(byte) << BigInt(8 * shift);
+  }
+  return value;
+}
+
+// Neither window nor byte order: the reading is not shown rather than shown with a guess in it.
 function rawSection(target) {
   const window = windowFor(target);
-  if (!window) return null;
+  const order = windowOrder(window);
+  if (!window || !window.chunks || !order) return null;
   const map = byteMap(window);
   const rows = [
     ["u8", 1, false],
@@ -3204,7 +3236,7 @@ function rawSection(target) {
     ["i64", 8, true],
     ["ptr", 8, false],
   ].map(([label, size, signed]) => {
-    const value = readWord(map, target, size);
+    const value = readWord(map, target, size, order);
     let text = "—";
     if (value !== null) {
       if (signed) {
@@ -3238,7 +3270,14 @@ function rawSection(target) {
   return h(
     "div",
     { class: "section" },
-    h("h4", {}, "read as", h("span", { class: "dim", text: ` ${targetArch() ?? "unknown arch"}, ${endianness()}-endian` })),
+    h(
+      "h4",
+      {},
+      "read as",
+      // Both facts come from the core (`/memory` carries its ELF header's answers), so this line is a statement
+      // about the dump rather than about the machine the page happens to be open on.
+      h("span", { class: "dim", text: ` ${windowArch(window) ?? "unknown arch"}, ${order}-endian` }),
+    ),
     rows,
   );
 }
@@ -3718,6 +3757,16 @@ function waitingPane(window, message) {
   );
 }
 
+// A short name for an address, for log lines: the window's own name when it has one (`heap`, `stack`), else
+// the region it belongs to, else the address. `[anon]` is true and useless; `heap` is what the reader sees.
+function window_label(address) {
+  const target = parseAddr(String(address));
+  const name = windowFor(target)?.name;
+  if (name) return name;
+  const region = regionOf(target);
+  return region ? leaf(region.path) ?? `[${region.kind}]` : String(address);
+}
+
 // The objects overlapping the window on screen — the overlay is drawn from them, so they are read with it.
 async function ensureObjects(address, length) {
   if (!state.live || state.objectPending) return;
@@ -3728,9 +3777,15 @@ async function ensureObjects(address, length) {
     const response = await fetch(`/api/sessions/${state.live.id}/objects?address=${address}&length=${length}`);
     const reply = await response.json();
     if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
+    const known = Object.keys(state.typedData).length;
     for (const object of reply) state.typedData[object.expression] = object;
     state.objectPages[key] = true;
     state.typed = null;
+    // Logged as an event rather than left to the count above, which was taken at load: "the session walked
+    // these" is a fact about the core that arrives *now*, and the log is where facts with a time on them go.
+    if (reply.length && Object.keys(state.typedData).length !== known) {
+      logEvent(`${window_label(address)}: ${reply.length} typed object${reply.length === 1 ? "" : "s"} on these bytes`);
+    }
     render();
   } catch (error) {
     state.objectPages[key] = true; // a refusal is an answer: do not ask again on every render
@@ -4777,10 +4832,12 @@ function installReport(data, { origin, sample = null }) {
   }
 
   // "0 typed objects" was a number about nothing: the summary carries none because they are read on demand,
-  // and a count of what is *not* in the payload is not a fact about the core.
-  const typed = state.data.typed?.on_demand
-    ? "typed objects: read on demand"
-    : `${Object.keys(typedObjects()).length} typed objects`;
+  // and a count of what is *not* in the payload is not a fact about the core. Worse, it stayed on screen: the
+  // count was taken at load, so a live session that had since walked `head` and every node it reaches still
+  // read "0 typed objects" beside the structure it was drawing.
+  const typed = Object.keys(state.data.typed?.objects ?? {}).length
+    ? `${Object.keys(typedObjects()).length} typed objects`
+    : "typed objects: walked on demand";
   // Where the data came from, and what it holds, become one *event*: the sentence is the `ready` line of the
   // log rather than a label that the next event would overwrite without trace.
   state.sample = sample;

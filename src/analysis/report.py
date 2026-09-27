@@ -63,18 +63,84 @@ WIDE_WINDOW = 1024
 
 
 ROOTS = ["head", "hops", "stray", "g_wide"]
-"""Where the demo's typed tree starts. Everything below is fetched by walking, not listed by hand."""
+"""Where the *demo's* typed tree starts. The fixture walks this list because it is the fixture's target; a live
+session does not have a list, and gets its roots from the frame instead — see `typed_roots`."""
 
 MAX_DEPTH = 5
 MAX_CHILDREN = 16
+MAX_OBJECTS = 80
 """Bounds for the walk. The product expands one level per click; the fixture walks ahead of time so the
 demo can show what a session would fetch on demand. `blob[512]` is 512 rows nobody asked for, and a pointer
-cycle must not walk forever — so an aggregate wider than `MAX_CHILDREN` is left as one opaque box."""
+cycle must not walk forever — so an aggregate wider than `MAX_CHILDREN` is left as one opaque box, and the
+whole walk stops at `MAX_OBJECTS`."""
 
 
-def typed_objects(transport: MiTransport) -> dict[str, dict]:
-    """The expressions the demo can interpret, walked from `ROOTS`."""
+def typed_roots(summary: dict) -> list[str]:
+    """The expressions a **live** session can start a typed walk from, read off its own first screen.
+
+    A live session has no `ROOTS`: that list is the demo target's, and a session may be looking at any core at
+    all. What it does have is the crashed frame's arguments — and an argument is the only typed root gdb can
+    hand over without a scan: `struct node *head` says *where* to look and *what shape* to look for, in one
+    word. Locals are the same thing one click away (`/frames/{level}`), and a session's view of the heap
+    normally starts at exactly this: the pointers the crash was holding.
+    """
+    detail = summary.get("detail") or {}
+    crashed = next(
+        (key for key, value in detail.items() if any(f.get("is_crash_site") for f in value.get("frames") or [])),
+        None,
+    )
+    frames = (detail.get(str(crashed)) or {}).get("frames") or []
+    if not frames:
+        return []
+    # A name and nothing else: the walk expands each root with `-var-create`, and an argument that cannot be
+    # evaluated as an expression (no DWARF, no symbols) refuses by itself — one refusal per root, recorded.
+    return [str(argument["name"]) for argument in frames[0].get("args") or [] if argument.get("name")]
+
+
+def typed_objects(
+    transport: MiTransport,
+    roots: list[str] | None = None,
+    *,
+    max_objects: int = MAX_OBJECTS,
+) -> dict[str, dict]:
+    """The typed objects reachable from `roots` (the demo's list by default), walked one level at a time.
+
+    The same walk both callers need: `scripts/dump-fixture.py` runs it for the fixture with the demo's roots, and
+    a live session runs it for its own crashed frame's arguments the first time something asks what is at an
+    address. One implementation, because two would drift — and the fixture exists to be the *same* answer.
+
+    **A pointer that lands on an address already walked is not followed.** `architecture.md` asks for exactly
+    that ("cycles are detected, not followed … never expanded again"), and the traversal used to do it by
+    *expression* alone — which detects `head` twice but not `head->next->next->next`, the same three-node ring
+    under a longer name. Measured on the practice core's `head`: two addresses came back six times out of
+    fourteen objects, so half the walk was the cycle. The child that closes it is marked with `cycle` — the
+    expression it already has an expansion under — and is left for the reader to follow as a link rather than
+    as another copy of the same struct.
+    """
     objects: dict[str, dict] = {}
+    walked: dict[int, str] = {}
+    """`address → the expression whose expansion is that address`. The path, in the sense above: a pointer that
+    arrives at one of these addresses is a cycle, not new ground."""
+
+    def pointer_target(child: dict) -> int | None:
+        """Where a *pointer* field points, or `None` for anything else.
+
+        Only pointers count. A nested struct's field can sit at offset 0, i.e. at the same address as its parent
+        — that is not a cycle and must still be walked, or a `struct wide` would open to one row.
+        """
+        if not str(child.get("type") or "").strip().endswith("*"):
+            return None
+        value = str(child.get("value") or "")
+        if not value.startswith("0x"):
+            return None
+        try:
+            target = int(value.split()[0], 16)
+        except ValueError:
+            return None
+        # NULL is not a cycle and not a place to walk: `0` would otherwise become an address the traversal
+        # believes it has already been to, which is how both `head->peer` and `head->payload` came back marked
+        # as cycles of a null pointer.
+        return target or None
 
     def behind(child: dict) -> bool:
         """Is there anything behind this field to walk into?
@@ -86,11 +152,12 @@ def typed_objects(transport: MiTransport) -> dict[str, dict]:
         """
         if not str(child.get("type") or "").strip().endswith("*"):
             return True
-        value = str(child.get("value") or "")
-        return value not in ("", "0x0") and value.startswith("0x")
+        return pointer_target(child) is not None
 
-    def visit(expression: str, depth: int) -> None:
-        if expression in objects or depth > MAX_DEPTH or len(objects) > 80:
+    def visit(expression: str, depth: int, address: int | None = None) -> None:
+        if expression in objects or depth > MAX_DEPTH or len(objects) > max_objects:
+            return
+        if address is not None and address in walked:
             return
         try:
             summary = transport.expand(expression)
@@ -100,16 +167,38 @@ def typed_objects(transport: MiTransport) -> dict[str, dict]:
             objects[expression] = {"expression": expression, "refused": str(exc).splitlines()[0][:200]}
             return
         objects[expression] = summary
+        here = _object_address(summary)
+        if here is not None:
+            walked.setdefault(here, expression)
         for child in summary.get("children") or []:
             if not child.get("num_children") or not child.get("expression"):
                 continue
             if child["num_children"] > MAX_CHILDREN or not behind(child):
                 continue
-            visit(child["expression"], depth + 1)
+            target = pointer_target(child)
+            if target is not None and target in walked:
+                child["cycle"] = walked[target]
+                continue
+            visit(child["expression"], depth + 1, target)
 
-    for root in ROOTS:
+    for root in ROOTS if roots is None else roots:
         visit(root, 0)
     return objects
+
+
+def _object_address(summary: dict) -> int | None:
+    """The address an expanded object starts at, when gdb gave it one.
+
+    A variable in a register has no address, and neither does a value gdb could not read — `None` is the
+    honest answer for both, and it keeps such an object out of the cycle path rather than putting `0` in it.
+    """
+    value = str(summary.get("address") or "")
+    if not value.startswith("0x"):
+        return None
+    try:
+        return int(value.split()[0], 16) or None
+    except ValueError:
+        return None
 
 
 def memory_windows(

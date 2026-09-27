@@ -146,14 +146,13 @@ def _stripped(path: pathlib.Path | None) -> bool:
         return ELFFile(handle).get_section_by_name(".symtab") is None
 
 
-def object_at(summary: dict, address: int) -> dict | None:
-    """The typed object the summary already knows about at this address — no gdb call.
+def object_at(index: dict[str, dict], address: int) -> dict | None:
+    """The typed object the session's index knows at this address — no gdb call.
 
-    A lookup, not a query: the DWARF types were walked once, and "what lives here" is answerable from that
-    index. When nothing is indexed at the address, the answer is `None` and the caller says so, rather than
-    inventing a type.
+    A lookup, not a query: the DWARF types were walked once (at load for the fixture, on the first ask for a
+    live session), and "what lives here" is answerable from that index. When nothing is indexed at the address,
+    the answer is `None` and the caller says so, rather than inventing a type.
     """
-    index = summary.get("typed", {}).get("objects", {})
     for expression, obj in index.items():
         value = obj.get("value")
         if not value:
@@ -183,7 +182,7 @@ def source_file(path_text: str | None, root: pathlib.Path | None = None) -> dict
     }
 
 
-def objects_in(summary: dict, address: int, length: int) -> list[dict]:
+def objects_in(index: dict[str, dict], address: int, length: int) -> list[dict]:
     """The typed objects overlapping `[address, address + length)`, for the overlay on those bytes.
 
     A range question, answered from the index the session already holds: the overlay wants every object the
@@ -192,7 +191,7 @@ def objects_in(summary: dict, address: int, length: int) -> list[dict]:
     """
     low, high = address, address + max(0, length)
     found: list[dict] = []
-    for expression, obj in summary.get("typed", {}).get("objects", {}).items():
+    for expression, obj in index.items():
         value = obj.get("value")
         if not value:
             continue

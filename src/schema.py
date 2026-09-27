@@ -352,6 +352,13 @@ class SessionStats(Permissive):
     gdb_pid: int | None = None
     gdb_alive: bool | None = None
     idle_s: float
+    typed_objects: int = 0
+    """How many objects the session's typed index holds. `0` means "none walked **or** none to walk", which is
+    why `typed_roots` is beside it: a stripped core and an unasked session both report zero objects, and only
+    the roots tell them apart."""
+    typed_roots: list[str] = []
+    """The expressions the index's walk started from — the crashed frame's arguments, empty when the dump has
+    no typed arguments to start from."""
 
 
 class ProcessStats(Permissive):

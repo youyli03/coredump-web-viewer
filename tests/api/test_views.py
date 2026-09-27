@@ -235,5 +235,13 @@ def test_expand_refuses_a_dump_that_has_no_types(live, stripped_bundle, core_for
     assert refused.json()["error"] == "unsupported"
     assert "DWARF" in refused.json()["detail"], "the refusal names the capability, not just the failure"
 
+    # The *lookup* endpoints say the same thing, and this is not a detail: an index over a dump that cannot be
+    # typed is not an empty index, so `[]` would read as "there is nothing at this address" — a claim about the
+    # dump instead of a statement about what this viewer can do with it.
+    for path, params in (("/objects", {"address": "0x0", "length": 64}), ("/object", {"address": "0x0"})):
+        lookup = live.get(f"/api/sessions/{session}{path}", params=params)
+        assert lookup.status_code == 501, f"{path}: {lookup.text}"
+        assert "DWARF" in lookup.json()["detail"]
+
     # Everything that does not need DWARF still works on the same session.
     assert live.get(f"/api/sessions/{session}/stack", params={"thread": _crashed(loaded["summary"])}).status_code == 200

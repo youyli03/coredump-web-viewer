@@ -63,7 +63,7 @@ and `DELETE /api/sessions`. §8 records what else has landed.
 | 1 | **there is no contract module** | `requirements.md` §8 and `architecture.md` §5 both name `src/schema.py` ("the unified data format, the frontend/backend contract"); the file does not exist. Every route returns `-> dict`, so `/openapi.json` documents almost nothing, and tests can only pin today's accidental shape |
 | 2 | **the architectural promises are unobservable** | `analysis/session.py` and `web/routes.py` contain no command counter and no result cache; only the transport caches backtraces internally (`mi.py`, "the stack, whole and cached"). `core_loads`, cache hits and command counts cannot be read from HTTP, so §1/§4/§6 cannot be asserted |
 | 3 | **the error body has two shapes** | `web/errors.py` answers `{"error", "detail"}` for transport exceptions, while `HTTPException` falls through to FastAPI's default `{"detail"}` — and an unparseable query parameter answers a third shape (FastAPI's 422 list). §13.7 asks for failures that are *clearly which of four they are*; three shapes is not that |
-| 4 | ~~two §13 acceptance items were unreachable~~ — **closed in P3** | §13.2 needed registers for any thread (the summary carried only the crashed one) and §13.5 needed a way to walk a type one level. Both are served now: `GET …/threads/{num}/registers`, and `POST …/expand` with the **type named by the caller**, which is the "interpret as…" picker of requirements §4 rather than guessed DWARF. What is still not built is an *address → type* index for a live session: `build_summary` is called with `include_typed=False`, so `GET …/object` answers 404 — and the detail now says `this session holds no typed index: name the type instead (POST /expand)` instead of reading like a typing mistake. A strict `xfail` stood here until P3, and the suite is `xfail`-free now |
+| 4 | ~~two §13 acceptance items were unreachable~~ — **closed in P3; the index behind them added later** | §13.2 needed registers for any thread (the summary carried only the crashed one) and §13.5 needed a way to walk a type one level. Both are served now: `GET …/threads/{num}/registers`, and the typed pair `GET …/object` · `GET …/objects` · `POST …/expand`. The last one names the **type** — the "interpret as…" picker of requirements §4 rather than guessed DWARF — and it was for a while the only half that worked on a live session: `build_summary` is called with `include_typed=False`, so the live summary held no typed index, `GET …/object` answered 404 for **every** live session, and the offline page (fed by the fixture, which *does* pre-fetch the index) drew its structure overlay happily. That asymmetry is gone: a session now walks its **own** index — the crashed frame's arguments, one level at a time, bounded at 80 objects / 5 levels / 16 children — on the first ask, and every ask after it is a lookup. Measured on the practice core's `head`: 44 gdb commands, 8 objects, then **0** per request. A dump whose capability says `dwarf_types: false` answers `501` from all three, because an index that *cannot* exist is not an empty one |
 | 5 | **the test prerequisites are absent** | `TestClient` needs an HTTP client; it is in neither the venv nor `requirements.txt` (whose only test dependency is `pytest`), and it has to be `httpx2` rather than `httpx` — starlette 1.7 imports `httpx2` and only falls back to `httpx` with a deprecation warning. There was no `tests/api/` and no HTTP test anywhere in the repository |
 | 6 | **nothing is controllable** | `CONFIG` is a module singleton read while it is imported (`main.py` already documents that trap for `--gdb`), `create_app()` takes no arguments, and each route resolves the checkout root from its own `__file__`. So a test cannot shorten `command_timeout_s` to exercise the deadline path, cannot shrink `max_limit` to exercise a refusal, and cannot point the "recent" file anywhere but the checkout |
 
@@ -105,7 +105,22 @@ read `error` without a completeness guarantee on our side.
 be absent for a given dump (`POST …/expand` on a target with no DWARF), and a capability that is absent is
 stated with the note the capability itself carries — `tests/api/test_views.py` builds a symbol-free copy of the
 practice binary and asserts exactly that, next to the assertion that the same session still answers threads,
-stack, registers and memory.
+stack, registers and memory. The three typed endpoints answer it alike, lookups included: `GET …/object` and
+`GET …/objects` are 501 rather than 404/`[]` there, because an index over a dump that *cannot* be typed is not
+an empty index — `[]` would read as "there is nothing at this address", which is a claim about the dump where
+the truth is a statement about the viewer.
+
+**A lookup that finds nothing is 404 and says how to look differently.** `GET …/object` at an address the
+session's index does not reach names the index's own extent and the way out:
+
+```text
+no type is known for 0xdead0000dead0000: the index holds what the crashed frame's arguments reach (head).
+Name the type instead (POST /expand), which is the 'interpret as…' picker of requirements.md §4 rather than
+guessed DWARF
+```
+
+A C dump has no runtime types, so "what type is at this address" is only answerable from what was walked or
+from a type the caller names. A viewer that guessed would be worse than one that asks.
 
 The four answers of §13.7 map onto `501` (no such capability), `409` (not ready yet), `502` (gdb died),
 `504` (timeout) — and a test asserts all four, because the v1 prototype's worst failure was answering

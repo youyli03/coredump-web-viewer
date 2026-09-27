@@ -229,26 +229,52 @@ def test_the_ceiling_refuses_a_read_that_is_too_large(live_tight, open_session) 
     assert allowed.status_code == 200, allowed.text
 
 
-def test_a_typed_lookup_without_an_index_says_so_and_names_the_way_out(live, open_session) -> None:
-    """§13.5's entry point, and what happens when it has nothing to look in.
+def test_a_typed_lookup_answers_from_the_session_s_own_index(live, open_session) -> None:
+    """§13.5's entry point: what is *at* an address, answered by the session rather than by the fixture.
 
-    This was a strict `xfail` while the typed walk was unreachable: the summary the live session builds holds
-    **no** typed index (the index belongs to the demo profiles that pre-fetch it), and `describe()` replaced it
-    with `{"on_demand": True}` while nothing served that request — so the page could re-root a tree and never
-    walk one. P3 added `POST …/expand`, which walks one level with the *type named by the caller* (the
-    "interpret as…" picker of requirements §4), and this 404 now says which endpoint to use instead of reading
-    like a typing mistake.
+    This was a strict `xfail` while the typed walk was unreachable, and then a 404 forever after: the live
+    summary is built without a typed index (the index belongs to the fixtures that pre-fetch it), so
+    `GET …/object` answered "this session holds no typed index" for **every** live session while the offline
+    page, fed by the fixture, drew its structure overlay happily — the exact asymmetry `docs/api.md` §1 exists
+    to catch.
+
+    The index is the session's own now: the crashed frame's arguments, walked one level at a time the first time
+    anything asks (`Session.typed_index`). Measured on the practice core's `head`: 44 gdb commands, 8 objects,
+    and **0** commands for every request after it.
     """
     body = open_session(live, sample="crash_target")
     session = body["id"]
     crashed = _crashed(body["summary"])
     head = _arg(_frame0(body["summary"], crashed["num"]), "head")
 
+    before = live.get(f"/api/sessions/{session}/stats").json()["commands_sent"]
     reply = live.get(f"/api/sessions/{session}/object", params={"address": head})
-    assert reply.status_code == 404, reply.text
-    assert reply.json()["error"] == "not-found"
-    assert "/expand" in reply.json()["detail"], "the refusal names the endpoint that can answer"
+    assert reply.status_code == 200, reply.text
+    found = reply.json()
+    assert found["expression"] == "head"
+    assert int(found["value"].split()[0], 16) == int(head, 16)
+    assert found["size"], "an object the overlay can draw has a size"
+    fields = {child["field"]: child for child in found["children"]}
+    assert {"id", "name", "next"} <= set(fields), "and the fields gdb named, with the offsets it measured"
+    assert fields["name"]["offset"] == 4 and fields["next"]["offset"] == 24
 
+    # The walk happens once. The second ask is a lookup, which is the difference between a scroll that costs
+    # commands and one that does not.
+    stats = live.get(f"/api/sessions/{session}/stats").json()
+    assert stats["typed_objects"] > 0 and stats["typed_roots"] == ["head"]
+    live.get(f"/api/sessions/{session}/object", params={"address": head})
+    again = live.get(f"/api/sessions/{session}/stats").json()
+    assert again["commands_sent"] == stats["commands_sent"], "a second lookup asks gdb nothing"
+    assert again["typed_objects"] == stats["typed_objects"]
+    assert before < stats["commands_sent"], "the first one did walk"
+
+    # An address nothing was walked to is a 404 — with the way out, not a typing-mistake message.
+    unindexed = live.get(f"/api/sessions/{session}/object", params={"address": "0xdead0000dead0000"})
+    assert unindexed.status_code == 404, unindexed.text
+    assert unindexed.json()["error"] == "not-found"
+    assert "/expand" in unindexed.json()["detail"], "the refusal names the endpoint that can answer"
+
+    # And `POST …/expand` is that way out: one level, with the type named by the caller.
     walked = live.post(f"/api/sessions/{session}/expand", json={"address": head, "type": "struct node"})
     assert walked.status_code == 200, walked.text
     assert walked.json()["children"], "and that endpoint really does answer"

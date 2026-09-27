@@ -73,6 +73,12 @@ class Session:
     created: float = field(default_factory=time.time)
     touched: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    _typed: dict[str, dict] | None = None
+    """`address → type` as far as this session has walked it, or `None` when nobody has asked yet.
+
+    `None` and `{}` are different answers and the difference is the point: the first is "not built", the second
+    is "built, and there is nothing to know" — a stripped core, or one with no debug information."""
+    _typed_roots: list[str] = field(default_factory=list)
 
     def settings(self) -> Any:
         return self.config or CONFIG
@@ -213,6 +219,35 @@ class Session:
         """How many gdb commands this session has sent so far — the number the HTTP layer reports as a delta."""
         return int(getattr(self.transport, "commands_sent", 0) or 0)
 
+    def typed_index(self) -> dict[str, dict]:
+        """The typed objects this session knows, walked **once** from the crashed frame's arguments.
+
+        The index is why `GET …/objects` can answer a live session at all. The live summary is built without it
+        (`include_typed=False`, because it is the fixture that pre-fetches what the *page* wants), which left the
+        endpoint answering `[]` and `/object` answering 404 for every live session — while the offline page, fed
+        by the fixture, drew its structure overlay happily. Two producers of one JSON that disagree about what
+        they hold is exactly the asymmetry §1 of `docs/api.md` exists to catch.
+
+        Built on demand rather than at load, because the walk costs gdb commands (measured on the practice core:
+        ~47 expansions, 2.6 s) and most requests never ask for it. Cached for the session's life, because a core
+        is a snapshot: the same walk would give the same answer. Empty when the frame hands over no roots — a
+        core with no debug information has no typed roots, and that is a fact about the dump rather than a
+        failure, so the endpoint answers with nothing and says why.
+        """
+        if self._typed is not None:
+            return self._typed
+        with self.lock:
+            if self._typed is None:
+                roots = report.typed_roots(self.summary or {})
+                self._typed = report.typed_objects(self.transport, roots) if roots and self.transport else {}
+                self._typed_roots = roots
+        return self._typed
+
+    def typed_roots(self) -> list[str]:
+        """Which expressions the index above was walked from — empty when there were none to walk."""
+        self.typed_index()
+        return self._typed_roots
+
     def stats(self) -> dict[str, Any]:
         """What this session has cost, and whether the debugger behind it is still there.
 
@@ -234,6 +269,10 @@ class Session:
             "gdb_pid": getattr(transport, "pid", None),
             "gdb_alive": (bool(transport.alive) if transport is not None else None),
             "idle_s": round(time.time() - self.touched, 1),
+            "typed_objects": len(self._typed or {}),
+            # How many the index holds — `0` both for "not asked yet" and for "asked, and this dump has none",
+            # which is why `typed_roots` is here too: the two are only distinguishable together.
+            "typed_roots": list(self._typed_roots),
         }
 
     def close(self) -> None:
