@@ -152,8 +152,15 @@ def test_the_fixture_and_a_live_session_build_the_same_summary(live, open_sessio
 
 
 @pytest.mark.gdb
-def test_a_generated_fixture_carries_the_contract_version(tmp_path: pathlib.Path) -> None:
-    """A fixture file on disk says which contract it was built to, so a stale one is visible."""
+def test_a_generated_fixture_carries_the_contract_version(live, tmp_path: pathlib.Path) -> None:
+    """A fixture file on disk says which contract it was built to, so a stale one is visible.
+
+    The `live` fixture is here for its **skip**, not its client: this test builds a summary through
+    `build_from_paths`, which needs the practice bundle *and* the cross gdb. It used to assert neither and
+    failed with `FileNotFoundError` where every other test that reads a core skips — measured with
+    `CDWV_GDB=/nonexistent-gdb`, where it was the only failure in the suite. A fresh clone is supposed to skip,
+    not to fail.
+    """
     import json
 
     import analysis.report as report
