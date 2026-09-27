@@ -21,6 +21,7 @@ const state = {
   window: 0, // index into memory.windows, the window last looked at
   trail: [], // addresses jumped *to*, so every jump can be walked back
   folded: {}, // stack groups the user opened, keyed by level+pc
+  railCollapsed: false, // the thread rail: collapsed to a spine, giving its width back to the view
   locals: {}, // frame locals read so far, keyed by `thread:level`
   selection: null, // the one selection: { address, start, end, objectKey, objectExpression, fieldExpression }
   asciiAligned: false, // ASCII as one cell per byte (aligned) or as compact text (readable)
@@ -609,12 +610,47 @@ function topbar() {
   );
 }
 
+// The thread rail, collapsed **sideways**.
+//
+// At 48 threads the rail is a full column of rows for a list the reader mostly reads the top of, and the screen
+// it is taking belongs to the stack or the bytes. Collapsing it gives that width back to the view: the column
+// becomes a spine you can click to bring it back, and it keeps saying what is behind it — the count and whether
+// anything crashed — because a strip that says nothing is a strip nobody dares click.
 function threadsPane() {
   const threads = state.data.threads;
+  const crashed = threads.find((thread) => thread.is_crashed);
+  if (state.railCollapsed) {
+    return h(
+      "aside",
+      { class: "aside collapsed" },
+      h("button", {
+        class: "rail-toggle",
+        title: "show the thread list",
+        text: "›",
+        onclick: () => toggleRail(),
+      }),
+      h(
+        "div",
+        { class: "rail-spine", title: `threads · ${threads.length}${crashed ? ` · #${crashed.num} crashed` : ""}`, onclick: () => toggleRail() },
+        crashed ? h("span", { class: "dot", text: "●" }) : null,
+        h("span", { text: `threads · ${threads.length}` }),
+      ),
+    );
+  }
   return h(
     "aside",
     { class: "aside" },
-    h("div", { class: "section-title", text: `threads · ${threads.length}` }),
+    h(
+      "div",
+      { class: "section-title with-toggle" },
+      h("span", { text: `threads · ${threads.length}` }),
+      h("button", {
+        class: "rail-toggle",
+        title: "collapse the rail to the left",
+        text: "‹",
+        onclick: () => toggleRail(),
+      }),
+    ),
     threads.map((thread) =>
       h(
         "div",
@@ -641,6 +677,11 @@ function threadsPane() {
       ),
     ),
   );
+}
+
+function toggleRail() {
+  state.railCollapsed = !state.railCollapsed;
+  render();
 }
 
 function tabs() {
@@ -4819,7 +4860,7 @@ function render() {
   app.appendChild(
     h(
       "div",
-      { class: "layout" },
+      { class: `layout ${state.railCollapsed ? "rail-collapsed" : ""}` },
       threadsPane(),
       h(
         "div",
