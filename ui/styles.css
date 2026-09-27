@@ -506,11 +506,16 @@ button.fval.jump.visited { color: var(--stack); }
 .boot-hint p, .boot-hint li { color: var(--dim); }
 .boot-hint code { font-family: var(--mono); background: var(--panel); padding: 1px 5px; border-radius: 3px; color: var(--fg); }
 
+/* The stripe says what kind of note this is, and it is read before the words are — so the *ordinary* outcome of
+   a click is green (filling the form from a recent core, which is exactly what the reader asked for) and amber
+   is kept for a caveat, red for a refusal. Amber on everything made a successful click look like a problem. */
 .toast {
   position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%);
-  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--exec);
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--read);
   border-radius: 5px; padding: 7px 12px; font-family: var(--mono); font-size: 12px; max-width: 70vw;
 }
+.toast.warn { border-left-color: var(--exec); }
+.toast.error { border-left-color: var(--crash); }
 
 /* --------------------------------------------------------------------------- */
 .codesection { margin: 10px 14px 40px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); }

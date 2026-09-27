@@ -109,8 +109,12 @@ const bytes = (n) =>
 const pad64 = (value) => value.toString(16).padStart(16, "0");
 const norm = (value) => `0x${BigInt(value).toString(16)}`;
 
-function toast(message) {
-  const node = h("div", { class: "toast", text: message });
+// A transient note with a **kind**, because the stripe on its left is read before the words are: an amber stripe
+// on "paths filled in — press Load to open it" says something went wrong when nothing did, and green on "this
+// core is not there any more" would say the opposite. `info` is the ordinary outcome of a click; `warn` is a
+// caveat the reader should know about; `error` is a refusal.
+function toast(message, kind = "info") {
+  const node = h("div", { class: `toast ${kind}`, text: message });
   document.body.appendChild(node);
   setTimeout(() => node.remove(), 3200);
 }
@@ -505,7 +509,7 @@ function trailEntry() {
 async function goTo(address, { keepTrail = false, showMap = false } = {}) {
   const target = typeof address === "bigint" ? address : parseAddr(address);
   if (target === null) {
-    toast(`${address} is not an address`);
+    toast(`${address} is not an address`, "warn");
     return;
   }
   const window = windowFor(target);
@@ -550,7 +554,7 @@ function animateScrollTo(from, to, duration = 180) {
 function goBack() {
   const previous = state.trail.pop();
   if (!previous) {
-    toast("nothing to go back to");
+    toast("nothing to go back to", "warn");
     return;
   }
   // The mode travels with the step: a jump made *from* the mappings list goes back to the list, one made from
@@ -599,7 +603,7 @@ function topbar() {
       ),
     ),
     h("span", { class: "spacer" }),
-    h("button", { text: "reload", onclick: () => toast("would re-create the session with the same paths") }),
+    h("button", { text: "reload", onclick: () => toast("would re-create the session with the same paths", "warn") }),
     h("button", {
       text: "close session",
       onclick: () => {
@@ -1282,7 +1286,7 @@ function colorOf(region) {
 async function selectAt(address, { trail = false, keepView = false, showMap = false } = {}) {
   const target = typeof address === "bigint" ? address : parseAddr(address);
   if (target === null) {
-    toast(`${address} is not an address`);
+    toast(`${address} is not an address`, "warn");
     return;
   }
   if (trail && state.address) state.trail.push(trailEntry());
@@ -4581,7 +4585,7 @@ function coreRow({ title, subtitle, why, fields, gone, onForget }) {
       class: `recent-row ${gone ? "gone" : ""}`,
       onclick: () => {
         if (gone) {
-          toast(`${fields.core} is not there any more`);
+          toast(`${fields.core} is not there any more`, "error");
           return;
         }
         state.form = { ...state.form, ...fields };
@@ -5339,7 +5343,7 @@ async function boot(which = null) {
 async function bootFromPaths(fields) {
   const core = String(fields.core ?? "").trim();
   if (!core) {
-    toast("a core path is needed");
+    toast("a core path is needed", "error");
     return;
   }
   const token = (state.loadToken = (state.loadToken ?? 0) + 1);
