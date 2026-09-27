@@ -207,12 +207,27 @@ class SessionDetail(Permissive):
 
 
 class MemoryWindow(Permissive):
-    """Bytes, and the holes between them. A hole is data, a refusal is `unreadable`."""
+    """Bytes, and the holes between them. A hole is data, a refusal is `unreadable`.
+
+    Every window is also *read*, because `requirements.md` C3 asks for the meaning beside the hex: each chunk
+    carries `ascii`, and `words` carries the window read in units of `width` — the core's own word size unless
+    the caller named another. `byte_order`, `word_size` and `arch` are the core's (from its ELF header), and
+    they are here because a decode without them is a guess: when they are absent, `words` is empty and
+    `refused.words` says why, rather than bytes being shown with plausible-looking numbers beside them.
+    """
 
     address: str
     length: int
     chunks: list[dict[str, Any]]
     unread: list[dict[str, Any]]
+    arch: str | None = None
+    byte_order: str | None = None
+    """`"little"` or `"big"`, or `None` when the core's ELF header could not be read."""
+    word_size: int | None = None
+    width: int | None = None
+    """The unit `words` was decoded in: the caller's `width`, else the core's word size."""
+    words: list[dict[str, Any]] | None = None
+    refused: dict[str, str] | None = None
 
 
 class FrameVariable(Permissive):

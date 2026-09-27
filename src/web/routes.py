@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from analysis.gdb.base import GdbError, Unsupported
+from analysis.reading import WIDTHS as READ_WIDTHS
 from analysis.session import Session, SessionManager
 from schema import (
     CONTRACT,
@@ -354,19 +355,30 @@ def capabilities(session_id: str, request: Request) -> dict:
 
 
 @router.get("/sessions/{session_id}/memory", response_model=MemoryWindow)
-def memory_at(session_id: str, request: Request, address: str, length: int = 256) -> dict:
+def memory_at(
+    session_id: str, request: Request, address: str, length: int = 256, width: int | None = None
+) -> dict:
     """Bytes, on demand — one window per scroll, which is the query-cost row in §5.
 
     Clamped by `config.max_limit`, because the ceiling is a policy and this is the endpoint a transcript could
     ask for a gigabyte from.
+
+    `width` is how the window is *read*, not how much of it is returned: the default is the core's own word
+    size, and only the sizes a reader asks about (1, 2, 4, 8, 16) are accepted, because a width nobody means is
+    a width whose numbers nobody checks.
     """
     session = _ready(request, session_id)
     limit = _config(request).max_limit
     if length < 1 or length > limit:
         raise HTTPException(status_code=400, detail=f"length must be 1..{limit}")
+    if width is not None and width not in READ_WIDTHS:
+        raise HTTPException(status_code=400, detail=f"width must be one of {list(READ_WIDTHS)}, or omitted")
     from analysis import queries
 
-    return queries.memory_at(session.transport, address, length)
+    # The core's shape travels with the *map* (`memory_map`), so the decode is asked for it rather than
+    # re-reading the ELF header on every scroll: three facts about the whole dump, read once at load.
+    shape = _with_summary(session).get("memory_map") or {}
+    return queries.memory_at(session.transport, address, length, shape=shape, width=width)
 
 
 @router.get("/sessions/{session_id}/disassemble", response_model=DisassemblyPage)

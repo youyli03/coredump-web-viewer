@@ -15,15 +15,49 @@ import pathlib
 from typing import Any
 
 from analysis.gdb.mi import MiTransport
+from analysis.reading import ascii_of, words_in
 
 
-def memory_at(transport: MiTransport, address: int | str, length: int) -> dict:
+def memory_at(
+    transport: MiTransport,
+    address: int | str,
+    length: int,
+    *,
+    shape: dict | None = None,
+    width: int | None = None,
+) -> dict:
     """Bytes, exactly as the transport reads them — including its own account of what was unreadable.
 
     The window is clamped rather than trusted: a request for a megabyte starting inside a 4 KB mapping gets the
-    4 KB that exist, because "the bytes past the end of the mapping" is not a thing the core can answer.
+    4K that exist, because "the bytes past the end of the mapping" is not a thing the core can answer.
+
+    Then the two readings `requirements.md` C3 asks for beside the hex: the **ASCII column** (one character per
+    byte, per chunk, so it lines up with the bytes it describes) and the **word-by-word reading** when no type
+    is known. Both need the core's own byte order and word width, so both come from `shape` — the map's
+    `arch`/`word_size`/`byte_order`, read once from the ELF header. A core whose shape could not be read gets
+    `unread`-honest bytes and **no** decode, with the reason in `refused`: a word decoded in the wrong byte
+    order is a wrong number nobody can tell from a right one.
     """
-    return transport.read_memory(address if isinstance(address, str) else hex(address), length)
+    window = transport.read_memory(address if isinstance(address, str) else hex(address), length)
+    for chunk in window.get("chunks") or []:
+        chunk["ascii"] = ascii_of(bytes.fromhex(str(chunk.get("bytes") or "")))
+
+    shape = shape or {}
+    byte_order = shape.get("byte_order")
+    word_size = width or shape.get("word_size")
+    window["arch"] = shape.get("arch")
+    window["byte_order"] = byte_order
+    window["word_size"] = shape.get("word_size")
+    window["width"] = word_size
+    if byte_order is None or word_size is None:
+        window["words"] = []
+        window["refused"] = {
+            "words": shape.get("reason")
+            or "this core's byte order and word size are unknown, so its bytes are shown and not decoded"
+        }
+        return window
+    window["words"] = words_in(window.get("chunks") or [], byte_order=byte_order, width=int(word_size))
+    return window
 
 
 def code_page(

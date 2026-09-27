@@ -96,3 +96,58 @@ def memory_map(core: pathlib.Path, stack_pointer: int | None = None) -> list[dic
         if region["kind"] is None:
             region["kind"] = pathlib.PurePosixPath(region["path"]).name
     return regions
+
+
+MACHINES = {
+    "EM_AARCH64": "aarch64",
+    "EM_X86_64": "x86_64",
+    "EM_386": "i386",
+    "EM_ARM": "arm",
+    "EM_MIPS": "mips",
+    "EM_PPC64": "powerpc64",
+    "EM_S390": "s390x",
+    "EM_RISCV": "riscv",
+    "EM_LOONGARCH": "loongarch64",
+}
+"""`e_machine` → the name a reader recognises. Ours, not a standard: the ELF file calls it `EM_AARCH64` and
+`analysis/gdb/mi.py`'s frame-record table calls it `aarch64`, so one of the two had to give, and the table
+that decodes frames is the one every other module already agrees with. An architecture that is not listed keeps
+its `EM_*` name lowercased rather than being mapped to something it is not."""
+
+
+def facts(core: pathlib.Path) -> dict[str, Any]:
+    """The core's own shape — architecture, word size, byte order — from its ELF header.
+
+    Three facts, and every one of them is a *decode* parameter rather than interesting on its own: a word read
+    in the wrong byte order is a wrong number that looks right, and a word read at the wrong width is a
+    different number altogether. So they are read here, from the file that declares them, and never assumed
+    from the machine this viewer happens to run on.
+
+    A value that cannot be read comes back `None` with the reason, because the honest consequence is that no
+    decode happens at all — see `analysis/reading.py` — and a caller that has to branch needs to know which of
+    the three was missing.
+    """
+    from elftools.elf.elffile import ELFFile
+
+    try:
+        with core.open("rb") as handle:
+            elf = ELFFile(handle)
+            machine = str(elf.header["e_machine"])
+            data = str(elf.header["e_ident"]["EI_DATA"])
+            word = int(elf.elfclass) // 8
+    except Exception as exc:  # noqa: BLE001 — any failure here means the same thing: no decode
+        return {"arch": None, "word_size": None, "byte_order": None, "reason": f"the ELF header could not be read: {exc}"}
+
+    if data not in ("ELFDATA2LSB", "ELFDATA2MSB"):
+        return {
+            "arch": machine.replace("EM_", "").lower(),
+            "word_size": word,
+            "byte_order": None,
+            "reason": f"the ELF header names a byte order this does not know: {data}",
+        }
+    return {
+        "arch": MACHINES.get(machine, machine.replace("EM_", "").lower()),
+        "word_size": word,
+        "byte_order": "little" if data == "ELFDATA2LSB" else "big",
+    }
+

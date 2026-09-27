@@ -24,6 +24,7 @@ if _VENDORED.is_dir():
     sys.path.insert(0, str(_VENDORED))
 
 from analysis.gdb.base import GdbError  # noqa: E402
+from analysis.elf import facts as core_facts  # noqa: E402
 from analysis.elf import memory_map  # noqa: E402
 from analysis.gdb.mi import MiTransport  # noqa: E402
 from schema import CONTRACT  # noqa: E402  (the contract is shared data; analysis/ may import it)
@@ -760,6 +761,10 @@ def build_summary(
     # anything is read — which is what lets the stack window be the whole mapping rather than a guess at how
     # much of it to show.
     regions = memory_map(core, stack_pointer)
+    # And the shape those bytes have to be read *in*: the core's own architecture, word size and byte order,
+    # from the same ELF header the regions came from. They travel with the map rather than being re-derived per
+    # window, because they are three facts about the whole dump and decoding needs all three to be right.
+    shape = core_facts(core)
     stack_region = next(
         (
             (int(region["start"], 16), int(region["end"], 16))
@@ -855,7 +860,7 @@ def build_summary(
         },
         "threads": threads,
         "detail": detail,
-        "memory_map": {"source": "core_pt_load+nt_file", "regions": regions},
+        "memory_map": {"source": "core_pt_load+nt_file", "regions": regions, **shape},
         "memory": memory,
         "typed": {"objects": typed},
         "stack": stack,

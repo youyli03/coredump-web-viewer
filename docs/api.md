@@ -121,7 +121,7 @@ dump itself refusing, and only one of those should ever put an error in front of
 `GET …/memory` answers three states, and they must not be confused — `requirements.md` C3 asks for the bytes
 *and* what they mean, and a window that gets either half wrong is a window that lies about a dump:
 
-* **bytes** → `chunks`;
+* **bytes** → `chunks`, each with its own `ascii` column and the words decoded out of it;
 * **the dump has no bytes here** → `unread`, `200` with the gaps listed (or `422 unreadable` with gdb's own
   sentence when *nothing* in the window could be read — measured on the practice core's deliberate stray
   pointer: *"0xdead0000dead0000 for 16 bytes is not in this dump: gdb refused the command: Unable to read
@@ -152,6 +152,15 @@ The cost is bounded by `_READ_ROUNDS` (64 commands per window) rather than by th
 contiguous window — a heap node, a live stack — costs **1** command, the partly resident page above costs the
 full 64 and reports the tail as `not_read`. Measured through the API: heap `1`, fully resident text page `1`,
 partly resident text page `64`, a wholly unreadable address `422` in `1`.
+
+The **reading** is in the same reply rather than in the browser, because a word's meaning depends on facts
+only the core has: `arch`, `word_size` and `byte_order` come from its ELF header (`analysis/elf.py`), travel
+with the window, and are what the decode uses — `words` are units of `width` (the caller's, default the core's
+word size; only 1, 2, 4, 8, 16 are accepted, and anything else is `400`). A unit is decoded only when it is
+wholly inside one chunk, aligned **on its address** so two overlapping windows agree about the word they share;
+a unit straddling a hole is absent rather than zero-filled. `unsigned` and `signed` are decimal strings, because
+a 64-bit value does not survive a JSON number in JavaScript. When the header cannot be read there is no decode
+at all: `words` is empty and `refused.words` says why, rather than numbers that look plausible.
 
 `requirements.md` §4 calls the unreadable case "a normal result, not an error", and it is — the *summary* carries
 it as data (`memory.missing`), and `ui/app.js` turns the refusal into an `unread` hole rather than a failure.
