@@ -1581,6 +1581,8 @@ function pieceLayout(objects) {
   // For each object, every *smaller contained* object's pieces — the ranges that drop its own pieces. Built
   // once, per object, from the containment relation that does not depend on the row either.
   const covering = new Map();
+  const contained = new Set();
+  
   // A smaller object that a piece of ours is dropped for has to *start inside us* — so the candidates for an
   // object are the objects beginning in its own range, found by binary search over the starts, not every object
   // in the window. That is what keeps this out of the O(objects²) class the per-row version lived in.
@@ -1605,6 +1607,7 @@ function pieceLayout(objects) {
       if (other.entry.object === entry.object) continue;
       if (!(Number(other.entry.object.size ?? 0) < size)) continue;
       if (!contains(entry.object, other.entry.object)) continue;
+      contained.add(other.entry.object);
       for (const piece of other.entry.pieces) ranges.push([piece.start, piece.end]);
     }
     covering.set(entry.object, ranges);
@@ -1617,7 +1620,55 @@ function pieceLayout(objects) {
     const startB = b.object.start ?? objectAddress(b.object) ?? 0n;
     return startA < startB ? -1 : startA > startB ? 1 : 0;
   });
-  return { laid, covering, order };
+  // Every piece of every object, in address order, so a row can ask for the pieces that overlap it instead of
+  // walking all of them. The row loop used to visit each of the ~4 500 objects' pieces per row — 45 000 tests
+  // for a row that has room for about ten — and there are 74 rows on screen and a render per scroll.
+  const pieces = [];
+  const rank = new Map();
+  order.forEach((entry, index) => rank.set(entry.object, index));
+  for (const entry of laid) {
+    for (const piece of entry.pieces) pieces.push({ entry, piece, start: piece.start, end: piece.end });
+  }
+  pieces.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  const maxEnd = new Array(pieces.length);
+  let furthest = 0n;
+  for (let index = 0; index < pieces.length; index += 1) {
+    if (pieces[index].end > furthest) furthest = pieces[index].end;
+    maxEnd[index] = furthest;
+  }
+  // The named ranges belong here too: they are a pure function of the same objects, they are ~40 000 ranges for
+  // a 500-frame overlay, and both the row layout and the minimap asked for them — building and sorting that list
+  // **twice per render** was measured at seconds on the heavy core's window.
+  // "Outermost" is the same containment relation, so it is answered here rather than with a nested scan per
+  // row: `objects.filter(o => !objects.some(other => contains(other, o)))` is 20 million contains() calls for a
+  // 500-frame overlay, and the hex pane asked it **once per row**.
+  const outer = laid.filter((entry) => !contained.has(entry.object)).map((entry) => entry.object);
+  return { laid, covering, contained, outer, order, rank, pieces, maxEnd, named: coverage(objects) };
+}
+
+// The pieces that can touch `[from, to)`: binary search to the first piece that starts before the row ends,
+// then walk while the piece starts before it ends. Sorted by the layer's own rank afterwards, because which
+// piece claims an overlapping byte is decided by that order and not by the address.
+function piecesForRow(layer, from, to) {
+  const { pieces, maxEnd } = layer;
+  let low = 0;
+  let high = pieces.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (pieces[middle].start < to) low = middle + 1;
+    else high = middle;
+  }
+  // Walking back has to stop somewhere, and "the piece before this one ends before the row" is the wrong test:
+  // an *enclosing* object starts far behind the row and reaches into it, so a piece that ends early says nothing
+  // about the ones before it. `maxEnd[i]` — the furthest end among pieces `0..i` — is the bound that works: once
+  // no earlier piece can reach the row, the scan is over. Without it this loop ran the whole list from wherever
+  // the bisect landed, per row, which measured at **10.4 s** for one screen of rows on the heavy core's window.
+  const found = [];
+  for (let index = low - 1; index >= 0 && maxEnd[index] > from; index -= 1) {
+    if (pieces[index].end > from) found.push(pieces[index]);
+  }
+  found.sort((a, b) => (layer.rank.get(a.entry.object) ?? 0) - (layer.rank.get(b.entry.object) ?? 0));
+  return found;
 }
 
 // One cache per *window build*: the objects array is built once per render and handed to every row of that
@@ -1665,19 +1716,18 @@ function rowPieces(objects, row) {
   };
 
   const out = [];
-  for (const entry of order) {
+  for (const { entry, piece } of piecesForRow(layer, rowStart, rowEnd)) {
     const { object } = entry;
-    for (const piece of entry.pieces) {
-      // The overlap of a group is drawn once, by its first field.
-      if (piece.kind === "field" && piece.position) continue;
-      const from = piece.start > rowStart ? piece.start : rowStart;
-      const to = piece.end < rowEnd ? piece.end : rowEnd;
-      if (from >= to) continue;
-      if (shaded(entry, from, to)) continue;
-      const kind = piece.kind === "field" ? fieldKind(piece.child) : null;
-      // Whatever of this piece is still unclaimed; a partial overlap leaves the remainder visible rather than
-      // throwing the whole field away.
-      for (const [spanFrom, spanTo] of claim(from, to)) {
+    // The overlap of a group is drawn once, by its first field.
+    if (piece.kind === "field" && piece.position) continue;
+    const from = piece.start > rowStart ? piece.start : rowStart;
+    const to = piece.end < rowEnd ? piece.end : rowEnd;
+    if (from >= to) continue;
+    if (shaded(entry, from, to)) continue;
+    const kind = piece.kind === "field" ? fieldKind(piece.child) : null;
+    // Whatever of this piece is still unclaimed; a partial overlap leaves the remainder visible rather than
+    // throwing the whole field away.
+    for (const [spanFrom, spanTo] of claim(from, to)) {
         out.push({
           ...piece,
           // `pieceKind` keeps "field" or "hole" (the structural question); `kind` is what the field *is*
@@ -1699,10 +1749,8 @@ function rowPieces(objects, row) {
           // keeps two neighbouring grey fields from reading as one.
           shade: piece.index % 2,
         });
-      }
     }
-  }
-  return out;
+  }  return out;
 }
 
 // Which field owns each byte of this row — the answer the *bytes* need, not the labels.
@@ -2007,7 +2055,7 @@ function overlayLegend() {
 // fields.
 function objectFrames(objects, row) {
   const rowEnd = row + 16n;
-  const outer = objects.filter((object) => !objects.some((other) => contains(other, object)));
+  const outer = layerFor(objects).outer;
   const frames = [];
   for (const object of outer) {
     if (object.start >= rowEnd || object.end <= row) continue;
@@ -2079,11 +2127,21 @@ function rowLayout(window, objects) {
   const start = BigInt(window.address);
   const first = start - (start % 16n);
   const end = start + BigInt(window.length);
-  const named = coverage(objects);
+  const named = layerFor(objects).named;
   const runs = [];
 
-  const blank = (from, to) =>
-    !named.some(([namedFrom, namedTo]) => namedFrom < to && from < namedTo) && rangeIsZero(window, from, to);
+  // "Is any of this page named" is a **cursor**, not a scan: the pages are walked in address order and
+  // `coverage` is sorted by address, so one pointer answers every page in a single pass. It used to be
+  // `named.some(...)` per page — measured on the heavy core's stack window, 940 pages against the ~4 500 ranges
+  // a 500-frame overlay brings is 4.2 million comparisons *per render*, and that is what made opening that
+  // window take tens of seconds while the practice core's two-page window was instant.
+  let namedAt = 0;
+  const namedIn = (from, to) => {
+    while (namedAt < named.length && named[namedAt][1] <= from) namedAt += 1;
+    const range = named[namedAt];
+    return Boolean(range && range[0] < to && from < range[1]);
+  };
+  const blank = (from, to) => !namedIn(from, to) && rangeIsZero(window, from, to);
   const rows = (from, to) => {
     const last = runs[runs.length - 1];
     if (last?.kind === "rows" && last.to === from) last.to = to;
@@ -2601,6 +2659,23 @@ function stackOverlayNote(window) {
   return ` · overlaid for ${shown} of ${stack.total} frames — the rest are pages away (stack view)`;
 }
 
+// The objects a window overlays, cached against the **state they are built from** — `overlayObjects` returns a
+// fresh array every render, so keying on the array's identity (which is what the piece layer's WeakMap does) can
+// never hit, and the layer was rebuilt per render. Rebuilt when the typed index or the stack's frames change,
+// which is what the window actually depends on.
+const overlayCache = new WeakMap();
+
+function overlayFor(window) {
+  const key = `${Object.keys(state.typedData ?? {}).length}:${(state.stackData?.frames ?? []).length}:${
+    (state.data.stack?.frames ?? []).length
+  }:${state.zoom ?? ""}`;
+  const cached = overlayCache.get(window);
+  if (cached?.key === key) return cached.objects;
+  const objects = overlayFor(window);
+  overlayCache.set(window, { key, objects });
+  return objects;
+}
+
 function hexPane(window, target) {
 
   const start = BigInt(window.address);
@@ -2868,7 +2943,7 @@ function minimapImage(spec, height) {
   const key = `${spec.window.address}:${spec.window.length}:${spec.total}:${height}:${(spec.window.chunks ?? []).length}`;
   if (state.minimapKey === key) return state.minimapImage;
 
-  const named = coverage(spec.objects);
+  const named = layerFor(spec.objects).named;
   // The rows are walked in address order and so is `named`, so "is this row named" is a *cursor*, not a search.
   // It was `named.some(...)` inside the per-row loop: measured on the heavy core's stack window, 240 384 rows
   // against ~5 000 named ranges is 1.2 *billion* comparisons, and it is what made opening that window hang the
