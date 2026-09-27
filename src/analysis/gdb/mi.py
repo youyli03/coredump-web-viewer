@@ -1078,19 +1078,31 @@ class MiTransport(Transport):
         self._slots[key] = out
         return [dict(slot) for slot in out]
 
+    def _console(self, command: str, *, timeout: float | None = None) -> str:
+        """Run one CLI command inside gdb and hand back exactly what it printed.
+
+        The transport's second and last place of this kind (the first is `info address`): some questions have no
+        MI command at all — a variable's location, and `frame apply`, which is how a *range* of frames is asked
+        about in one go. What comes back is text, and it stays text until a caller parses the one field it
+        named; nothing here reshapes gdb's answer into something gdb did not say.
+
+        The command is quoted as an MI cstring, so a format string with quotes in it survives the trip.
+        """
+        records = self._exec(f"-interpreter-exec console {_mi_quote(command)}", timeout=timeout)
+        return "".join(
+            str(record.get("text") or "") for record in records if record.get("kind") in ("console", "log")
+        )
+
     def _location_text(self, expression: str) -> str | None:
         """`info address` for one variable, as text.
 
         There is no MI command for a variable's location: `-symbol-info-variables` returns the symbol, and
-        `-stack-list-variables --all-values` returns nothing at all on a core. So this goes through
-        `-interpreter-exec console` — the one place where the transport deliberately reads a *formatted*
-        answer, and it reads it as text, never as truth it can reshape.
+        `-stack-list-variables --all-values` returns nothing at all on a core. Hence the CLI, and hence `_console`.
         """
         try:
-            records = self._exec(f'-interpreter-exec console "info address {expression}"')
+            return self._console(f"info address {expression}")
         except GdbError:
             return None
-        return "".join(str(record.get("text") or "") for record in records if record.get("kind") in ("console", "log"))
 
     def _read_frame_record(self, frame: dict[str, Any], fp: int) -> dict[str, Any] | None:
         """The frame record at `fp`, or `None` when this dump does not have those bytes.
@@ -1125,7 +1137,22 @@ class MiTransport(Transport):
         """
         cached = self._located.setdefault(thread_num, {})
         frames = self._frames(thread_num)
+        levels = [
+            frame["level"]
+            for frame in frames
+            if frame["level"] is not None and first <= frame["level"] <= upto
+        ]
+        missing = [level for level in levels if level not in cached]
+        if not missing:
+            return cached
+
         self._select_thread(thread_num)
+        if self._apply_locations(missing[0], missing[-1], cached):
+            return cached
+
+        # One frame at a time. Not dead code: `frame apply` arrived in gdb 8.1, this transport is meant to work
+        # with whatever gdb a machine has (the same rule as the capability probes), and a refusal or an output
+        # shape this does not recognise is a slower answer rather than a failed one.
         for frame in frames:
             level = frame["level"]
             if level is None or level < first:
@@ -1140,6 +1167,53 @@ class MiTransport(Transport):
                 "fp": _int_literal(self._expression_text("$fp")),
             }
         return cached
+
+    def _apply_locations(self, first: int, upto: int, cached: dict[int, dict[str, int | None]]) -> bool:
+        """`sp` and `fp` for a whole range of frames in **one** command. False if this gdb cannot.
+
+        `frame apply level A-B` runs a command on each frame of a range, inside gdb, in one pass — which is the
+        whole point: selecting a frame is O(its depth) *inside gdb* (measured: 5 ms at level 0, 549 ms at level
+        20 000, and 536 ms again after any `-thread-select`, which resets gdb's frame cache), so two commands per
+        frame made a window of a deep stack cost the depth. Measured on a 30 000-frame stack: 21 frames cost
+        92 ms here against 549 ms for the first selection alone the old way.
+
+        The output is parsed by its own markers rather than by counting lines: gdb prints `#<level> …` before
+        each frame's output, so a frame whose `$sp` cannot be read — a corrupted stack — leaves a gap that does
+        not shift everything after it.
+        """
+        # A raw string, and not for style: this format belongs to **gdb's** printf, not to Python's. Written as
+        # an ordinary literal, `\n` is a newline in Python before gdb ever sees it, and gdb then receives a
+        # command broken over two lines — measured, and the only symptom is `Undefined command: ""`, because
+        # the second half of the command reads to gdb as an empty command name.
+        shape = r"%p %p\n"
+        command = f'frame apply level {first}-{upto} printf "{shape}", $sp, $fp'
+        try:
+            text = self._console(command)
+        except GdbError:
+            return False
+
+        level: int | None = None
+        found = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                head = line[1:].split(" ", 1)[0]
+                level = int(head) if head.isdigit() else None
+                continue
+            if level is None:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                continue  # a refusal or a note, not a pair: the next `#level` re-synchronises
+            sp, fp = _int_literal(parts[0]), _int_literal(parts[1])
+            if sp is None and fp is None:
+                continue  # two tokens that are not numbers are still a note
+            # Either may be None: gdb prints some registers as decimal (`549405564880`) and a frame whose
+            # `$fp` cannot be read still has an `$sp`. `_int_literal` is the one parser for both forms.
+            cached[level] = {"sp": sp, "fp": fp}
+            found += 1
+            level = None
+        return found > 0
 
     def stack_pointer(self, thread_num: int) -> int | None:
         """The stack pointer of this thread's current frame, asked as `$sp`.

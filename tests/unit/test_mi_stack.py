@@ -102,9 +102,12 @@ FRAME_2 = 2
 class FakeGdb:
     """A canned gdb that remembers which frame is selected, because `$sp` depends on it."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, frame_apply: bool = True) -> None:
         self.commands: list[str] = []
         self.selected = 0
+        self.frame_apply = frame_apply
+        """Whether this gdb knows `frame apply` (gdb 8.1 and later). False models an older one, which the
+        transport has to answer one frame at a time rather than refusing to answer at all."""
 
     def exec(self, command: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         self.commands.append(command)
@@ -115,6 +118,20 @@ class FakeGdb:
             return parse_records(["^done"])
         if command.startswith("-stack-list-variables"):
             return parse_records([FRAME0_VARIABLES])
+        if command.startswith("-interpreter-exec console") and "frame apply level" in command:
+            if not self.frame_apply:
+                return parse_records(['^error,msg="Undefined command: \"frame\"."'])
+            span = command.split("frame apply level ", 1)[1].split(" ", 1)[0]
+            first, _, last = span.partition("-")
+            # The shape gdb really prints, captured from a session on the practice core: a `#<level> …` header
+            # before each frame's output, then the line the command printed. The header is what makes this
+            # self-describing — a frame whose registers cannot be read leaves a gap that shifts nothing.
+            lines = []
+            for level in range(int(first), int(last) + 1):
+                registers = REGISTERS_BY_LEVEL[level]
+                lines.append(f"#{level} 0x0000c585b55d0e38 in descend (depth={level}) at big.c:114")
+                lines.append(f"{registers['$sp']} {registers['$fp']}")
+            return _mi_stream("\n".join(lines) + "\n")
         if command.startswith("-interpreter-exec console"):
             name = command.split("info address ", 1)[-1].rstrip('"')
             if name in LOCATION_BY_NAME:
@@ -149,9 +166,9 @@ class FakeGdb:
         return parse_records(["^done"])
 
 
-def _transport() -> tuple[MiTransport, FakeGdb]:
+def _transport(*, frame_apply: bool = True) -> tuple[MiTransport, FakeGdb]:
     transport = MiTransport(gdb_path="gdb", core_path="core")
-    fake = FakeGdb()
+    fake = FakeGdb(frame_apply=frame_apply)
     transport._exec = fake.exec  # type: ignore[method-assign]
     return transport, fake
 
@@ -309,7 +326,13 @@ def test_an_extent_that_does_not_grow_is_not_a_range_and_says_so() -> None:
 
 
 def test_asking_about_frames_selects_each_of_them_once() -> None:
-    transport, fake = _transport()
+    """The fallback path, for a gdb without `frame apply` (older than 8.1).
+
+    Every frame is selected once, and the second call selects nothing because `sp`/`fp` are cached — which is
+    what the batched path replaced with a single command, without changing this behaviour for a gdb that has
+    no batch to offer.
+    """
+    transport, fake = _transport(frame_apply=False)
     transport.stack_frames(1, low=0, high=2)
     selects = [command for command in fake.commands if command.startswith("-stack-select-frame")]
     assert selects == ["-stack-select-frame 0", "-stack-select-frame 1", "-stack-select-frame 2"]
@@ -369,3 +392,31 @@ def test_a_variable_with_no_stack_slot_still_says_where_it_is() -> None:
         if slot["where"] != "stack":
             assert slot["slot"] is False
             assert slot["value"] is not None or slot["location"] is not None
+
+
+def test_a_range_of_frames_is_asked_for_in_one_command() -> None:
+    """`frame apply level A-B`: one command for a window, instead of two per frame.
+
+    Selecting a frame is O(its depth) *inside gdb*, and `-thread-select` resets that cache, so a window of a
+    deep stack used to cost the depth twice over — measured on a 30 000-frame core, 21 frames took 549 ms for
+    the first selection and a window at offset 20 000 cost 52.7 seconds and 45 321 commands. One `frame apply`
+    answers the whole range in one pass: 22 commands, 0.10 s, on the same core.
+    """
+    transport, fake = _transport()
+    frames = transport.stack_frames(1, low=0, high=2)
+
+    applies = [command for command in fake.commands if "frame apply level" in command]
+    assert len(applies) == 1, f"a three-frame window should be one command, not {len(applies)}"
+    assert "level 0-2" in applies[0], applies[0]
+    assert not [c for c in fake.commands if c.startswith("-stack-select-frame")], (
+        "the per-frame path is the fallback, and it was not needed here"
+    )
+    # And the values are the ones the per-frame path answers, because both read gdb's `$sp`/`$fp`.
+    assert frames[0]["sp"] == REGISTERS_BY_LEVEL[0]["$sp"]
+    assert frames[0]["fp"] == REGISTERS_BY_LEVEL[0]["$fp"]
+    assert frames[2]["sp"] == REGISTERS_BY_LEVEL[2]["$sp"]
+
+    # Again: cached, so not even the one command is sent.
+    before = len(fake.commands)
+    transport.stack_frames(1, low=0, high=2)
+    assert not [c for c in fake.commands[before:] if "frame apply" in c or "stack-select-frame" in c]
