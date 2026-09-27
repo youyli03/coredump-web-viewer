@@ -232,6 +232,7 @@ Four gates, and two of them are the ones that bite:
 | **stack slots** (`frame_slots`) | on demand, one frame per click | which bytes of the stack window each variable occupies |
 | **code** (disassemble) | on demand, **one window per scroll**, cached by range | the instructions beside the bytes on screen |
 | memory map (segments: range, permissions, size, source file) | load (once) | summary → memory view |
+| **what a heap mapping holds** (`heap`: chunk headers, wilderness, totals) | on demand, **one click**, **0 gdb commands** for the walk and ≤ 4 once per session for `main_arena` | the memory view's `heap` button and line; the only answer there is for an anonymous mapping with no file behind it (`docs/api.md` §3.4) |
 | **what each mapping's bytes are** (`image`: ELF class, machine, object type, build-id) | load (once), **0 gdb commands** — four bytes per region, then a probe only for the ones that are images | the memory view's `elf 1424e4bd…` tags, and the *record* half of identification (`docs/api.md` §3.3a) |
 | **the dump's shared objects** (`libraries`) | load (once), **one command** | the *second* naming source for the map: a region is named from it when the core's own `NT_FILE` note named nothing (`docs/api.md` §3.1a) |
 | **identifying a mapping by its content** | on demand, **one click**, and **0 gdb commands** | which file an anonymous mapping's bytes came from — an inference, and the only one (`docs/api.md` §3.3) |

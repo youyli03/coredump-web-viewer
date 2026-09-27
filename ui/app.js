@@ -49,6 +49,8 @@ const state = {
   objectAsked: {}, // addresses whose object has been asked for
   identified: {}, // region start → what content matching made of that mapping (the *only* inferred answer)
   identifyPending: null, // the region start whose request is in flight
+  heaps: {}, // region start → what the allocator's own structures say about that mapping
+  heapPending: null, // the region start whose heap request is in flight
   stackPending: false, // one request, however many renders happen while it is in flight
   instruction: null, // the selected instruction: the bytes, its chip and its rail line are one thing
   sample: null, // which sample the data on screen came from — the chip that is lit reads this, nothing else
@@ -4243,6 +4245,34 @@ async function identifyRegion(start) {
   render();
 }
 
+// Is this anonymous writable mapping a heap, and what is in it? Asked for, like everything else that reads
+// something other than the summary: the walk itself is arithmetic over the dump, but it is still a question the
+// reader asks about the mapping they are looking at rather than one the page answers in the background.
+async function heapRegion(start) {
+  if (!state.live || state.heapPending) return;
+  state.heapPending = start;
+  render();
+  try {
+    const response = await fetch(`/api/sessions/${state.live.id}/heap?address=${start}`);
+    const reply = await response.json();
+    if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
+    state.heaps[start] = reply;
+    const summary = reply.summary;
+    logEvent(
+      summary
+        ? `${window_label(start)}: heap — ${summary.chunks} chunks, ${bytes(summary.covered)} of chunks, ` +
+          `top ${bytes(summary.top)}` +
+          (reply.arena?.symbol ? `, and gdb confirms main_arena` : "")
+        : `${window_label(start)}: not a heap — ${reply.reason}`,
+    );
+    if (reply.arena && !reply.arena.symbol) logEvent(`arena not available: ${reply.arena.why}`);
+  } catch (error) {
+    state.heaps[start] = { error: String(error.message ?? error) };
+  }
+  state.heapPending = null;
+  render();
+}
+
 // One object, for the rail: the typed tree is a lookup by address, so that is the question to ask.
 async function ensureObject(address) {
   if (!state.live) return;
@@ -4434,6 +4464,18 @@ function memoryView() {
           onclick: () => identifyRegion(region.start),
         })
       : null,
+    // A heap is the one anonymous mapping that explains itself, and only a writable one can be a heap: the
+    // allocator writes into the memory it hands out.
+    state.live && region && !region.path && region.perms.includes("w")
+      ? h("button", {
+          class: `twisty ${state.heaps[region.start]?.heap ? "active" : ""}`,
+          // Not `heap`: the window switcher is already called that, and two buttons with one name is a
+          // question the reader has to answer by clicking. This is the action — walk the mapping as chunks.
+          text: state.heapPending === region.start ? "reading…" : "chunks",
+          title: "walk this mapping as glibc chunk headers: what the allocator wrote into it",
+          onclick: () => heapRegion(region.start),
+        })
+      : null,
     windows.map((window, index) =>
       h("button", {
         class: `twisty ${shown === window ? "active" : ""}`,
@@ -4551,6 +4593,7 @@ function memoryView() {
     { class: "view memview" },
     header,
     identifyNote(region),
+    heapNote(region),
     strip,
     legend,
     state.mappings
@@ -4610,6 +4653,18 @@ function memoryView() {
                           title: "identified by comparing these bytes with the files this session was given",
                         },
                         "inferred",
+                      )
+                    : null,
+                  // The mapping whose bytes are a chunk chain: an answer about the mapping's *structure*, read
+                  // out of it, and the only one available for a heap at all.
+                  state.heaps[item.start]?.heap
+                    ? h(
+                        "span",
+                        {
+                          class: "src",
+                          title: `${state.heaps[item.start].summary.chunks} chunks, read from the mapping's own headers`,
+                        },
+                        `heap ${state.heaps[item.start].summary.chunks}`,
                       )
                     : null,
                   // And the mapping's own reading, when its bytes are an ELF image: not a name for the mapping,
@@ -4687,6 +4742,49 @@ function identifyNote(region) {
 function shortId(id, length = 8) {
   if (!id) return "—";
   return id.slice(0, length);
+}
+
+// What the allocator wrote into the mapping: chunk headers, the wilderness, and the totals. A heap is the one
+// anonymous mapping a dump can explain without a note, a symbol or a file — and the line says which of those
+// three it did *not* need, because that is the point.
+function heapNote(region) {
+  if (!region || !state.live) return null;
+  const answer = state.heaps[region.start];
+  if (!answer) return null;
+  if (answer.error) {
+    return h("div", { class: "identify-note" }, h("span", { class: "dim", text: `could not read the heap: ${answer.error}` }));
+  }
+  const summary = answer.summary;
+  if (!summary) {
+    return h(
+      "div",
+      { class: "identify-note" },
+      h("span", { class: "tag", text: "not a heap" }),
+      h("span", { class: "dim", text: ` ${answer.reason}` }),
+    );
+  }
+  const chunk = answer.heap?.address_chunk;
+  const here = chunk
+    ? ` · at this address: chunk ${chunk.address} (${bytes(chunk.size)}, ${chunk.in_use ? "in use" : "free"})`
+    : "";
+  const arena = answer.arena?.symbol
+    ? " · gdb's own main_arena agrees"
+    : " · no arena symbol in this libc, so this is the chunk headers alone";
+  return h(
+    "div",
+    { class: "identify-note" },
+    h("span", { class: "tag on", text: "heap" }),
+    h("span", { text: ` ${answer.heap.kind} · ${summary.chunks} chunks` }),
+    h("span", {
+      class: "dim",
+      text:
+        ` · in use ${bytes(summary.in_use)}, free ${bytes(summary.free)}, top ${bytes(summary.top)}` +
+        ` · ${Math.round(summary.coverage * 100)}% of the mapping is that chain` +
+        (summary.scan_truncated ? " (scan stopped; more follow)" : "") +
+        here +
+        arena,
+    }),
+  );
 }
 
 // What gdb knows about this dump's objects and could not place. It is the answer to "why is this region still
@@ -5410,6 +5508,8 @@ function installReport(data, { origin, sample = null }) {
   state.objectAsked = {};
   state.identified = {};
   state.identifyPending = null;
+  state.heaps = {};
+  state.heapPending = null;
   state.stackPending = false;
   state.stackRefused = null;
   state.ui = "ready";

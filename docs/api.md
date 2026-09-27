@@ -46,7 +46,7 @@ turns one of §13's acceptance items into data.
 `GET /api/health` · `GET /api/samples` · `GET /api/defaults` · `GET /api/recent` ·
 `DELETE /api/recent/{index}` · `POST /api/sessions` · `GET /api/sessions/{id}` · `POST /api/sessions/{id}/reload` · `DELETE /api/sessions/{id}` ·
 `GET /api/sessions/{id}/memory` · `…/disassemble` · `…/identify` · `…/object` · `…/objects` · `…/stack` ·
-`…/frames/{level}`
+`…/frames/{level}` · `…/heap`
 
 Two endpoints in §5 and §6 are now in the tree and are **not** part of that list: `…/sessions/{id}?wait=<n>`
 and `DELETE /api/sessions`. §8 records what else has landed.
@@ -55,7 +55,7 @@ and `DELETE /api/sessions`. §8 records what else has landed.
 |---|---|
 | `health` `samples` `defaults` `recent` | good — pure reads, no core, no gdb: they are the smoke layer |
 | `POST /sessions`, `GET /sessions/{id}`, `DELETE` | workable — but loading is asynchronous, so a test can only poll and hope; and every open **writes the checkout's own `.coredump-viewer.json`** |
-| `…/memory`, `…/disassemble`, `…/identify`, `…/object`, `…/objects`, `…/stack`, `…/frames/{level}` | correct answers, no cost observable — nothing reports how many gdb commands a request sent, or whether it was answered from cache |
+| `…/memory`, `…/disassemble`, `…/identify`, `…/heap`, `…/object`, `…/objects`, `…/stack`, `…/frames/{level}` | correct answers, no cost observable — nothing reports how many gdb commands a request sent, or whether it was answered from cache |
 
 ### 2.1 What is missing, with the evidence
 
@@ -359,6 +359,60 @@ something the user did not ask for, so an id with no file behind it is handed ba
 fetch it (`debuginfod-find debuginfo <id>`) — and `symbols.searched` lists every path that was opened, so "there
 is no such file here" and "nobody said where to look" are different answers.
 
+### 3.4 A heap explains itself: the allocator's own structures
+
+An anonymous writable mapping is the least informative thing in a dump and usually the most interesting — it is
+where the program's data lives. Nothing in the dump says it is a heap: `NT_FILE` names only file-backed mappings,
+and the build of libc in a real dump often cannot help either, because distributions strip it. Measured on this
+checkout's practice bundle, gdb refuses **every** one of `&main_arena`, `main_arena.top`, `main_arena.system_mem`
+and `mp_.sbrk_base` with `-var-create: unable to create variable object` — that libc has no symbols for them.
+
+What is left is the structure glibc writes *through* the memory it hands out, and `GET …/heap?address=` walks it:
+
+```json
+{
+  "address": "0xc9bc79ad42a0",
+  "region": {"start": "0xc9bc79ad4000", "size": 135168, "dumped": 135168, "perms": "rw-p", "kind": "anon"},
+  "heap": {"kind": "main arena (brk)", "first_chunk_at": "0xc9bc79ad4000", "chunk_count": 17,
+           "address_chunk": {"address": "0xc9bc79ad4290", "size": 64, "flags": 1, "in_use": true}},
+  "chunks": [{"address": "0xc9bc79ad4000", "size": 656, "in_use": true, "flags": 1}],
+  "summary": {"chunks": 17, "covered": 135168, "coverage": 1.0, "in_use": 5760, "free": 0,
+              "top": 129408, "scan_truncated": false},
+  "arena": {"symbol": null, "why": "gdb has no `main_arena` in this dump's libc, so the arena cannot be asked: …"},
+  "reason": "17 chunk headers in a row, each 16-byte aligned and at least 32 bytes, and each successor's `prev_size` agreeing with what it follows — 100.0% of this mapping is a chain of chunks, which is what an allocator's heap looks like and what nothing else does"
+}
+```
+
+| the rule | why it is there, and what it was measured on |
+|---|---|
+| the three low bits of a size word are **flags**, the rest is the size | the first version of this walk checked 16-byte alignment on the raw word and refused the practice core's very first real chunk: `0x291` is a 656-byte chunk with `PREV_INUSE` set |
+| a chunk's own status is read from its **successor's** header | `PREV_INUSE` describes the chunk *before* the one it is written in. Asking a chunk about itself is how a heap reports every block as in use |
+| a **free** chunk's size must appear in its successor's `prev_size` | the one invariant that separates a chain of chunks from a page of numbers that happen to look like sizes. It is checked only when the successor is a plausible header: measured, a misaligned size word was otherwise reported as its *predecessor's* problem, which is how one diagnoses the wrong chunk |
+| the last chunk of a chain that reaches the end of the mapping is the **top** chunk; one that runs into the scan limit is not | a 4 MB slice of a gigabyte heap must not put a wilderness size in the summary that was never read |
+| a chain is a heap only at `>= 4` chunks and `>= 90%` coverage | real heaps measure **100%** — the wilderness reaches the end of what the arena owns — so this is a floor, not a tuning knob |
+| one chunk with `IS_MMAPPED` **is** the whole mapping | a large `malloc` takes a mapping of its own: header, no chain, no wilderness |
+| a `heap_info` at the start means the first chunk is not at offset zero | a thread's arena is an `mmap`ed heap whose first words are the arena pointer, the previous heap and a size. Measured: doing this check *after* the walk looked at offset zero is wrong, because the arena pointer itself masks to a plausible chunk size (`0x…0040`) |
+
+Measured on this checkout's cores — the reason the rules can be trusted:
+
+| | |
+|---|---|
+| the practice core's heap | **17 chunks over 100%** of its 132 KB mapping, the wilderness `0xc9bc79ad5680` at 126.4 KB, in use 5.6 KB |
+| the heavy core's heap | **51 chunks over 100%** of its 132 KB mapping |
+| every other anonymous region | no chain at all — the other 27 regions of the practice core, the other 112 of the heavy core, and every region of the five other practice cores |
+| the mapping the heavy program *calls* its heap | **refused**, and it should be: that gigabyte is a raw `mmap`, not a `malloc`, so there is no allocator metadata in it. A viewer that recognised the *word* heap would have answered something here |
+| cost | **0 gdb commands** for the walk (it reads the dump), at most **4** once per session for the arena, and cached per address afterwards |
+
+**`arena` is the confirmation, and it is reported either way.** With `libc6-dbg` (or an unstripped libc) those
+expressions answer and the wilderness the walk found can be checked against `main_arena.top` — a record agreeing
+with an inference. With this bundle's stripped libc they are refused, and the reply carries gdb's own words. What
+it never does is silently give up: the walk needs no symbols at all, which is why it exists.
+
+In the GUI the button (`heap`) appears for an anonymous writable mapping in the memory view's header, and the
+line under it reads `heap main arena (brk) · 17 chunks · in use 5.6 KB, free 0 B, top 126.4 KB · 100% of the
+mapping is that chain · at this address: chunk 0xc9bc79ad4290 (64 B, in use) · no arena symbol in this libc, so
+this is the chunk headers alone`.
+
 ---
 
 ## 4. Observability (L2)
@@ -451,6 +505,7 @@ exactly 1). The frame **locations** for a whole window are now asked for in one 
 | `GET …/symbolize?address` | the mapping, the enclosing function with the offset into it, and — for a stack address — the thread whose stack pointer is inside that mapping. A heap address answers "no function contains this", a stack address answers with the thread, and the deliberate stray pointer answers three absences with three reasons |
 | `GET …/capabilities` | §13.6, the same bits the summary carries (asserted equal), including the note that says why something is false |
 | `…/identify` | what file an anonymous mapping's bytes came from: `200` with the inference and its arithmetic, `404` for an address in no mapping (naming the map's extent), and **0 gdb commands** — it reads candidate files, not the dump. The one answer in this API that is an inference rather than a record (§3.3) |
+| `…/heap` | what an anonymous writable mapping is, as the allocator wrote it: a chunk chain (with the chunk at the address, the wilderness and the totals) or a refusal naming the offset and the number that failed. **0 gdb commands** for the walk, ≤ 4 once per session for `main_arena`, cached per address (§3.4) |
 | `POST …/reload` | reads the **same core again** in a new session: `201` with the new id, the new session is whole (poll it the same way), and the one it replaced is evicted by capacity — measured on the practice core, 0.9 s end to end. The paths are the *session's* own, not the caller's and not the summary's: the summary reports a display path (relative to this checkout when it can be), and re-opening from a string that was only meant to be read is how a viewer ends up analysing a file nobody named. A session that **failed** to load reloads too — that is when a reader most wants another try — so the endpoint needs `404`-able existence, not readiness |
 
 Each of these is *thin by rule* (§5 of architecture: a route that computes anything has put logic in the wrong

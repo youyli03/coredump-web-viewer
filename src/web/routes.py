@@ -30,6 +30,7 @@ from schema import (
     MemoryWindow,
     OpenSession,
     ProcessStats,
+    HeapAnswer,
     Registers,
     RegionIdentity,
     SessionStats,
@@ -459,6 +460,33 @@ def identify_region(session_id: str, request: Request, address: str) -> dict:
     _with_summary(session)
     try:
         return session.identify(int(address, 16))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/heap", response_model=HeapAnswer)
+def heap_at(session_id: str, request: Request, address: str) -> dict:
+    """Is the mapping at this address a glibc heap, and what is in it — read from the mapping itself.
+
+    An anonymous writable mapping is usually the program's data and is the one thing in a dump that names itself
+    without a note, without a symbol and without a file: glibc writes a chunk header in front of every block it
+    hands out, and a chain of those covering a whole mapping is not something else produces. This walks that
+    chain and reports what it verified — the chunk at the address, its neighbours, the wilderness, and the
+    totals — or refuses with the offset and the number that failed.
+
+    It is an **inference**, and the only kind that can be checked arithmetically: every step re-reads the next
+    header and requires the size to be aligned and big enough and the free-chunk invariant to hold. `arena` is
+    the confirmation — glibc's own `main_arena`, when this dump's libc has symbols for it; measured on this
+    checkout's bundle, a stripped libc refuses every one of those expressions, and that refusal is what the reply
+    reports rather than something it hides.
+
+    Cost: **0 gdb commands** for the walk (it reads the dump), at most four once per session for the arena, and
+    cached per address afterwards.
+    """
+    session = _ready(request, session_id)
+    _with_summary(session)
+    try:
+        return session.heap(int(address, 16))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -263,6 +263,26 @@ class RegionIdentity(Permissive):
     reason: str | None = None
 
 
+class HeapAnswer(Permissive):
+    """What an anonymous mapping is, as the allocator sees it — a heap, or why it is not one.
+
+    `heap` is `null` when the mapping is not a heap *and* when it cannot be shown to be one, and `reason` says
+    which: a size word that is not a chunk size (with the address it failed at), too few chunks to mean anything,
+    a chain that covers only part of the mapping, or a mapping the dump holds no bytes for. `chunks` are the
+    headers around the address asked about, `summary` carries the totals and whether the scan was cut short, and
+    `arena` is glibc's own arena when this dump's libc has symbols for it — reported whether it answers or not,
+    because a stripped libc is why the walk exists at all.
+    """
+
+    address: str
+    region: dict[str, Any]
+    heap: dict[str, Any] | None = None
+    chunks: list[dict[str, Any]]
+    summary: dict[str, Any] | None = None
+    arena: dict[str, Any] | None = None
+    reason: str | None = None
+
+
 class FrameVariable(Permissive):
     name: str
     type: str | None = None

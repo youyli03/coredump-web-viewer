@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from analysis import elfimage, matching, report
+from analysis import elfimage, heap, matching, report
 from analysis.gdb.base import GdbTimeout
 from config import CONFIG
 from schema import CONTRACT
@@ -79,6 +79,16 @@ class Session:
     `None` and `{}` are different answers and the difference is the point: the first is "not built", the second
     is "built, and there is nothing to know" — a stripped core, or one with no debug information."""
     _typed_roots: list[str] = field(default_factory=list)
+    _heaps: dict[str, dict] = field(default_factory=dict)
+    """`address → what the allocator's own structures say about the mapping there`, cached like the rest.
+
+    Reading a heap is reading the dump: the walk itself costs 0 gdb commands and two requests for the same
+    address must cost none at all — which is `architecture.md` §4's promise, and the reason every on-demand
+    answer in this file is cached per session.
+    """
+    _arena: dict | None = None
+    """glibc's arena, asked for **once** per session: with an unstripped libc the expressions answer, with this
+    checkout's bundle they are refused (`analysis/heap.py`), and either way the answer does not change."""
     _identified: dict[str, dict] = field(default_factory=dict)
     """`address → what analysis/matching.py made of the mapping there`, cached for the session's life.
 
@@ -325,6 +335,50 @@ class Session:
             self._identified[key] = answer
             return answer
 
+    def heap(self, address: int) -> dict[str, Any]:
+        """What the mapping at this address is, as the allocator sees it — see `analysis/heap.py`.
+
+        A heap is the one thing in a dump that names itself without a note, without a symbol and without a file:
+        glibc writes chunk headers through the memory it hands out, and a chain of them that covers the whole
+        mapping is not something anything else produces. Measured on the practice core, the 132 KB mapping the
+        program's `head` lives in walks as **17 chunks, 100% of the mapping**, while none of the other 27 regions
+        of that core produces a chain at all — and the same walk finds 51 chunks in the heavy core's heap.
+
+        The arena symbols are asked for as a *confirmation*, once per session, and reported whether or not they
+        answer: this bundle's libc is stripped, so gdb refuses them in its own words, and a reply that hid that
+        would be hiding the reason the walk has to exist.
+        """
+        key = hex(address)
+        with self.lock:
+            if key in self._heaps:
+                return self._heaps[key]
+            summary = self.summary or {}
+            memory_map = summary.get("memory_map") or {}
+            regions = memory_map.get("regions") or []
+            region = next(
+                (item for item in regions if int(item["start"], 16) <= address < int(item["end"], 16)),
+                None,
+            )
+            if region is None:
+                raise LookupError(
+                    f"{key} is not in any mapping of this dump: the map covers "
+                    f"{regions[0]['start']}–{regions[-1]['end']} in {len(regions)} regions"
+                    if regions
+                    else f"{key} cannot be read as a heap: this session's summary carries no mappings"
+                )
+            answer = heap.describe(
+                self.core,
+                region,
+                address,
+                size_sz=int(memory_map.get("word_size") or 8),
+            )
+            if self._arena is None:
+                self._arena = heap.arena_facts(self.transport)
+            answer["address"] = key
+            answer["arena"] = self._arena
+            self._heaps[key] = answer
+            return answer
+
     def stats(self) -> dict[str, Any]:
         """What this session has cost, and whether the debugger behind it is still there.
 
@@ -417,6 +471,50 @@ class SessionManager:
 
     def _note_failure(self) -> None:
         self.sessions_failed += 1
+
+    def heap(self, address: int) -> dict[str, Any]:
+        """What the mapping at this address is, as the allocator sees it — see `analysis/heap.py`.
+
+        A heap is the one thing in a dump that names itself without a note, without a symbol and without a file:
+        glibc writes chunk headers through the memory it hands out, and a chain of them that covers the whole
+        mapping is not something anything else produces. Measured on the practice core, the 132 KB mapping the
+        program's `head` lives in walks as **17 chunks, 100% of the mapping**, while none of the other 27 regions
+        of that core produces a chain at all — and the same walk finds 51 chunks in the heavy core's heap.
+
+        The arena symbols are asked for as a *confirmation*, once per session, and reported whether or not they
+        answer: this bundle's libc is stripped, so gdb refuses them in its own words, and a reply that hid that
+        would be hiding the reason the walk has to exist.
+        """
+        key = hex(address)
+        with self.lock:
+            if key in self._heaps:
+                return self._heaps[key]
+            summary = self.summary or {}
+            memory_map = summary.get("memory_map") or {}
+            regions = memory_map.get("regions") or []
+            region = next(
+                (item for item in regions if int(item["start"], 16) <= address < int(item["end"], 16)),
+                None,
+            )
+            if region is None:
+                raise LookupError(
+                    f"{key} is not in any mapping of this dump: the map covers "
+                    f"{regions[0]['start']}–{regions[-1]['end']} in {len(regions)} regions"
+                    if regions
+                    else f"{key} cannot be read as a heap: this session's summary carries no mappings"
+                )
+            answer = heap.describe(
+                self.core,
+                region,
+                address,
+                size_sz=int(memory_map.get("word_size") or 8),
+            )
+            if self._arena is None:
+                self._arena = heap.arena_facts(self.transport)
+            answer["address"] = key
+            answer["arena"] = self._arena
+            self._heaps[key] = answer
+            return answer
 
     def stats(self) -> dict[str, Any]:
         """The process-level half of `docs/api.md` §4: how many sessions were opened, evicted and failed."""

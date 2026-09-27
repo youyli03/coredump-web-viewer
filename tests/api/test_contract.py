@@ -41,6 +41,7 @@ DOCUMENTED_PATHS = {
     "/api/sessions/{session_id}/memory",
     "/api/sessions/{session_id}/disassemble",
     "/api/sessions/{session_id}/identify",
+    "/api/sessions/{session_id}/heap",
     "/api/sessions/{session_id}/object",
     "/api/sessions/{session_id}/objects",
     "/api/sessions/{session_id}/stack",
