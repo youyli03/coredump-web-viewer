@@ -111,6 +111,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 
 /* ---------- stack: an IDA-style flow graph down the call chain ---------- */
 .flow { display: flex; flex-direction: column; align-items: center; padding: 4px 0 30px; }
+/* The end of a page: the control that reads the next one, and the sentinel the observer watches. */
+.flowmore { display: flex; align-items: center; gap: 10px; padding: 10px 0 4px; }
 .arrow { color: var(--dim); font-size: 13px; line-height: 1; padding: 3px 0; }
 .fnode {
   display: grid; grid-template-columns: 74px 1fr auto; align-items: start; gap: 10px;

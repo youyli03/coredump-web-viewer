@@ -60,6 +60,15 @@ in the core's bytes" is not the same thing as "not in this dump".
 WIDE_WINDOW = 1024
 """`struct wide` is 696 bytes and lives in .bss; a round 1024 covers it with room to see the edges."""
 
+STACK_PAGE = 500
+"""How many frames one answer carries: the first screen's page, and `GET …/stack`'s default.
+
+A page, not a cap: `requirements.md` §5 says a stack can have tens of thousands of frames, and both ends of the
+API are built for that (`offset`/`limit` in, `total`/`truncated` out). The number is 500 because that is what the
+first screen already ships, so a reader who asks for the stack without naming a page gets exactly what they were
+looking at. Measured on the 30 000-frame sample, asking for the whole stack at once cost **235.6 s and 420 146
+gdb commands** — most of it the per-frame variable work — where the first page is seconds."""
+
 
 
 ROOTS = ["head", "hops", "stray", "g_wide"]
@@ -672,6 +681,18 @@ def stack_detail(
     first = max(0, offset)
     last = total - 1 if limit is None else min(total - 1, first + max(0, limit) - 1)
     frames = transport.stack_frames(thread_num, low=first, high=last) if last >= first else []
+    # A page has to be *displayable* on its own. A flow graph needs each frame's function, its source site and
+    # what the call was given; `stack_frames` answers the memory question and carries none of those. Without
+    # this the only frames a stack view could render were the ones the summary happened to pre-fetch, so page
+    # two of a 30 000-frame stack would have arrived as 500 rows with no names — a "stripped core" that is
+    # nothing of the kind. Measured: `-stack-list-arguments` for a 500-frame page is **one** command.
+    if frames:
+        tuples = transport.backtrace(thread_num, offset=first, limit=len(frames))["frames"]
+        arguments = transport.frame_arguments(thread_num, low=first, high=last)
+        for row, frame in zip(frames, tuples):
+            for field in ("func", "file", "line", "arch"):
+                row[field] = frame.get(field)
+            row["args"] = arguments.get(row["level"], [])
     slots: dict[str, list[dict]] = {}
     for frame in frames:
         try:
@@ -819,7 +840,7 @@ def build_summary(
     for thread in threads:
         # `with_arguments` costs one extra query for the *whole* stack, and a stack view without them is
         # only function names.
-        backtrace = transport.backtrace(thread["num"], limit=500, with_arguments=True)
+        backtrace = transport.backtrace(thread["num"], limit=STACK_PAGE, with_arguments=True)
         payload = {"total": backtrace["total"], "frames": backtrace["frames"]}
         if thread["is_crashed"]:
             payload["registers"] = transport.registers(thread["num"])

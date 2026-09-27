@@ -58,10 +58,14 @@ def test_registers_of_a_thread_that_does_not_exist_is_not_found(live, open_sessi
 # requirements §5: a stack that pages, and says what it left out
 # --------------------------------------------------------------------------- #
 def test_the_stack_pages_and_reports_the_total(live, open_session) -> None:
-    """`limit`/`offset` with an honest total.
+    """`limit`/`offset` with an honest total — and no `limit` means **one page**, not the whole stack.
 
     A response that returned three of twenty-eight frames without saying so is a hole the reader cannot tell
     from the end of the stack — the same mistake `stack_detail`'s docstring refuses for the whole-stack case.
+    What changed is what "no limit" asks for: the page the first screen carries (`report.STACK_PAGE`), because
+    on the 30 000-frame sample the unpaged request cost 235.6 s and 420 146 gdb commands
+    (`tests/api/test_scale.py` holds that one). On this 28-frame thread the page is bigger than the stack, so
+    the answer is all of it and it says `truncated: false`.
     """
     body = open_session(live, sample="crash_target")
     session = body["id"]
@@ -71,13 +75,16 @@ def test_the_stack_pages_and_reports_the_total(live, open_session) -> None:
     total = everything["total"]
     assert total == len(everything["frames"]) > 3, "the practice core's crash thread is deep on purpose"
     assert everything["truncated"] is False
-    assert everything["offset"] == 0 and everything["limit"] is None
+    assert everything["offset"] == 0
+    assert everything["limit"] == 500, "the default page: the same one the first screen carries"
 
+    # A window that is genuinely narrower than the stack says so, and returns the same frames the unpaged
+    # answer did — the same frames, not a second interpretation.
     window = live.get(f"/api/sessions/{session}/stack", params={"thread": thread, "offset": 1, "limit": 2}).json()
     assert [frame["level"] for frame in window["frames"]] == [1, 2]
     assert window["total"] == total, "a window still says how many there are"
     assert window["truncated"] is True, "and that it is a window"
-    assert window["frames"] == everything["frames"][1:3], "the same frames, not a second interpretation"
+    assert window["frames"] == everything["frames"][1:3]
 
     # Every page together is the whole stack, once.
     levels = []

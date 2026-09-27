@@ -174,6 +174,72 @@ def test_a_wide_window_is_a_window_and_not_the_whole_walk(heavy) -> None:
 
 
 @pytest.mark.gdb
+def test_the_stack_with_no_limit_is_a_page_and_not_the_whole_thing(heavy) -> None:
+    """**The third cost bug this file found.** "No `limit` means all of it" is a promise this API cannot keep.
+
+    Measured on this 30 002-frame stack before the page existed: `/stack` with no `limit` took **235.6 s and
+    420 146 gdb commands** — and that is the UI's own request when the stack view opens, most of it the
+    per-frame variable work. It now answers the page the first screen already carries (500 frames, measured at
+    1.2 s / ~7 000 commands) and says where it sits, so the rest is one request away instead of one request too
+    many.
+
+    The assertion is about *cost*, like the rest of this file: a command count is a property of the code, and
+    seconds are a property of this machine.
+    """
+    client, loaded = heavy
+    session = loaded["id"]
+    crashed = next(t["num"] for t in loaded["summary"]["threads"] if t["is_crashed"])
+
+    reply = client.get(f"/api/sessions/{session}/stack", params={"thread": crashed})
+    assert reply.status_code == 200, reply.text
+    body = reply.json()
+    assert len(body["frames"]) == 500, "one page, not 30 002"
+    assert body["limit"] == 500 and body["offset"] == 0
+    assert body["total"] >= 30000
+    assert body["truncated"] is True, "and the reply says so, or a page reads as the whole stack"
+
+    # A page costs a page's worth of work. 7 006 commands measured here; the ceiling is loose on purpose,
+    # because the number that matters is the shape, not this machine's speed.
+    cost = int(reply.headers["x-gdb-commands"])
+    assert cost < 20000, f"one page of 500 frames cost {cost} gdb commands, which is the whole stack again"
+
+    # And the next page is exactly that: one page further in, nothing repeated and nothing skipped.
+    second = client.get(f"/api/sessions/{session}/stack", params={"thread": crashed, "offset": 500})
+    assert second.status_code == 200, second.text
+    following = second.json()
+    assert following["frames"][0]["level"] == 500
+    assert len(following["frames"]) == 500
+    assert int(second.headers["x-gdb-commands"]) < 20000
+
+
+@pytest.mark.gdb
+def test_a_stack_page_can_be_drawn_on_its_own(heavy) -> None:
+    """A page of frames is not just addresses: it carries what a flow graph draws.
+
+    This is what makes paging possible for the stack view at all. The summary pre-fetches one page *with*
+    arguments, while `stack_frames` answers the memory question and carries no `func`, no source site and no
+    arguments — so before this, page two of a deep stack would have arrived as rows with no names, which is
+    exactly what a stripped core looks like. Measured: the arguments for a 500-frame page cost **one** command.
+    """
+    client, loaded = heavy
+    session = loaded["id"]
+    crashed = next(t["num"] for t in loaded["summary"]["threads"] if t["is_crashed"])
+
+    before = client.get(f"/api/sessions/{session}/stats").json()["commands_by_op"].get("-stack-list-arguments", 0)
+    page = client.get(f"/api/sessions/{session}/stack", params={"thread": crashed, "offset": 1000, "limit": 50})
+    assert page.status_code == 200, page.text
+    frames = page.json()["frames"]
+    assert len(frames) == 50
+    for frame in frames:
+        assert frame["func"], "every frame of the page has a name"
+        assert "args" in frame, "and what the call was given"
+        assert frame["level"] >= 1000
+
+    after = client.get(f"/api/sessions/{session}/stats").json()["commands_by_op"].get("-stack-list-arguments", 0)
+    assert after - before == 1, "one command for the page's arguments, not one per frame"
+
+
+@pytest.mark.gdb
 def test_a_single_frame_can_be_asked_for_at_any_depth(heavy) -> None:
     """One frame is one click, and the click has to work at 20 000 as well as at 0.
 

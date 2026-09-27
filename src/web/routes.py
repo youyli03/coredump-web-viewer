@@ -464,6 +464,12 @@ def stack(
     `offset`/`limit` page it (requirements §5), and the answer carries `total` and `truncated`, because a
     truncated stack that does not say it is truncated is a hole the reader cannot tell from the end of the
     stack.
+
+    **No `limit` means one page, not the whole stack** (`report.STACK_PAGE` = 500 — the page the first screen
+    already carries). It used to mean "all of it", which is a promise this API cannot keep: measured on a
+    30 000-frame stack, that request took **235.6 s and 420 146 gdb commands**, most of it the per-frame
+    variable work. The reply says which page it is (`offset`, `limit`, `total`, `truncated`), so a caller that
+    wants the next one asks for it, and a caller that wants the whole stack asks for it in pages.
     """
     if levels is not None:
         # Refused rather than ignored: a query parameter that is silently dropped answers a different question
@@ -481,7 +487,8 @@ def stack(
         raise HTTPException(status_code=404, detail=f"this dump has no thread {number}")
     if offset < 0 or (limit is not None and limit < 1):
         raise HTTPException(status_code=400, detail="offset must be >= 0 and limit >= 1")
-    return report.stack_detail(session.transport, number, offset=offset, limit=limit)
+    page = report.STACK_PAGE if limit is None else limit
+    return report.stack_detail(session.transport, number, offset=offset, limit=page)
 
 
 @router.get("/sessions/{session_id}/threads/{num}/registers", response_model=Registers)

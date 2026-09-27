@@ -235,7 +235,12 @@ function stackSource() {
   return state.stackData ?? state.data.stack ?? {};
 }
 
-// The parsed stack, on demand: one request for the thread whose stack is on screen.
+// The parsed stack, on demand: **one page** for the thread whose stack is on screen.
+//
+// The server answers a page (`limit` defaults to 500, the same page the first screen carries), because asking
+// for the whole stack is a promise it cannot keep: measured on a 30 000-frame dump, one unpaged request cost
+// 235.6 seconds and 420 146 gdb commands. A page is 1.2 s and ~7 000, and the reply says where it sits
+// (`offset`, `limit`, `total`, `truncated`), so the rest is one request away — `loadMoreStack` below.
 async function ensureStack(thread) {
   if (!state.live || thread === null || state.stackData || state.data.stack?.frames?.length) return;
   if (state.stackPending) return;
@@ -247,6 +252,40 @@ async function ensureStack(thread) {
     state.stackData = reply;
     state.stack = null; // the derived frames were built from the other source
     state.typed = null; // and the index over those frames is stale the moment they change
+  } catch (error) {
+    state.stackRefused = String(error.message ?? error);
+  }
+  state.stackPending = false;
+  render();
+}
+
+// The next page of the same thread, appended to the one on screen.
+//
+// Appended rather than re-fetched from zero: a page is a bounded cost, and asking for `offset=0&limit=1000`
+// would pay for the frames already read. `slots` merge the same way, so the overlay keeps drawing every frame
+// it has bytes for.
+async function loadMoreStack() {
+  const stack = state.stackData;
+  if (!state.live || !stack || state.stackPending || !stack.truncated) return;
+  const loaded = (stack.frames ?? []).length + (stack.offset ?? 0);
+  if (loaded >= (stack.total ?? 0)) return;
+  state.stackPending = true;
+  render(); // the button says it is working rather than looking ignored
+  try {
+    const page = stack.limit ?? 500;
+    const response = await fetch(
+      `/api/sessions/${state.live.id}/stack?thread=${stack.thread}&offset=${loaded}&limit=${page}`,
+    );
+    const reply = await response.json();
+    if (!response.ok) throw new Error(reply.detail ?? `HTTP ${response.status}`);
+    state.stackData = {
+      ...reply,
+      offset: stack.offset ?? 0,
+      frames: [...(stack.frames ?? []), ...(reply.frames ?? [])],
+      slots: { ...(stack.slots ?? {}), ...(reply.slots ?? {}) },
+    };
+    state.stack = null;
+    state.typed = null;
   } catch (error) {
     state.stackRefused = String(error.message ?? error);
   }
@@ -717,7 +756,12 @@ function groupNode(group, threadNum) {
           "div",
           { class: "fhead" },
           h("span", { class: "fn", text: first.func ?? "??" }),
-          h("span", { class: "count", text: `×${group.frames.length}` }),
+          h("span", {
+            class: "count",
+            // `×24 so far`: the run may continue past the end of the page that carries it, and a count that
+            // does not say so is a claim about the whole stack made from a page of it.
+            text: `×${group.frames.length}${group.more ? " so far" : ""}`,
+          }),
           h("span", {
             class: "site",
             text: first.file ? `${leaf(first.file)}:${first.line ?? "?"}` : "no source",
@@ -751,9 +795,19 @@ function groupNode(group, threadNum) {
 function stackView(detail) {
   // The stack view is a stack on screen, so this is where it is read.
   ensureStack(state.thread);
-  const frames = detail.frames ?? [];
+  // Which frames are on screen: the pages fetched so far when there are any (they carry everything a flow
+  // graph needs — function, source site, arguments — see `report.stack_detail`), else the summary's own page,
+  // which is what the static fixture has.
+  const live = state.live && (state.stackData?.frames ?? []).length ? state.stackData : null;
+  const frames = live ? live.frames : detail.frames ?? [];
+  const total = live ? live.total ?? frames.length : detail.total ?? frames.length;
+  const more = Boolean(live?.truncated) && frames.length < total;
   const crashed = state.data.threads.find((thread) => thread.num === state.thread)?.is_crashed;
   const groups = frameGroups(frames);
+  // A run of identical frames that is cut by the end of a page is *so far*, not all of it: saying `×24` about
+  // twenty-four of an unknown number is the same class of claim as calling a truncated stack complete. The
+  // count settles the moment the next page arrives.
+  if (more && groups.length) groups[groups.length - 1].more = true;
   const ordered = state.order === "gdb" ? groups : groups.slice().reverse();
   const arrow = state.order === "gdb" ? "↑" : "↓";
 
@@ -762,6 +816,24 @@ function stackView(detail) {
     if (index) nodes.push(h("div", { class: "arrow", text: arrow }));
     nodes.push(groupNode(group, state.thread));
   });
+  if (more) {
+    const sentinel = h("div", { class: "flowmore" },
+      h("button", {
+        class: "twisty",
+        text: state.stackPending
+          ? "reading the next page…"
+          : `load the next ${Math.min(live.limit ?? 500, total - frames.length)} frames`,
+        title: `frames ${frames.length}–${Math.min(frames.length + (live.limit ?? 500), total) - 1} of ${total}`,
+        onclick: () => loadMoreStack(),
+      }),
+      h("span", { class: "dim", text: ` ${frames.length} of ${total} frames on screen` }),
+    );
+    // And the same thing when the reader simply scrolls to the end: the button is the visible control, the
+    // observer is the same action without a click. One request at a time — `loadMoreStack` refuses while one
+    // is in flight — so a long scroll cannot stack up pages.
+    watchNear(sentinel);
+    nodes.push(sentinel);
+  }
 
   const read = Object.keys(state.locals).filter((key) => key.startsWith(`${state.thread}:`)).length;
   return h(
@@ -773,7 +845,9 @@ function stackView(detail) {
       h("span", {
         class: "frames-note",
         text:
-          `${detail.total ?? frames.length} frames · ${groups.length} flow steps · arguments for every frame` +
+          `${total} frames · ${groups.length} flow steps` +
+          `${more ? ` · showing ${frames.length}` : ""}` +
+          " · arguments for every frame" +
           ` · locals on click${read ? ` (${read} read)` : ""}` +
           `${crashed ? " · level 0 is the crash site" : " · this thread did not fault"}`,
       }),
@@ -2369,6 +2443,14 @@ function instructionBox(instruction, source = null) {
   );
 }
 
+// Which part of a deep stack the overlay on this window actually covers, when it is not all of it.
+function stackOverlayNote(window) {
+  const stack = stackSource();
+  if (window.name !== "stack" || !stack.truncated) return null;
+  const shown = (stack.frames ?? []).length + (stack.offset ?? 0);
+  return ` · overlaid for ${shown} of ${stack.total} frames — the rest are pages away (stack view)`;
+}
+
 function hexPane(window, target) {
   const map = byteMap(window);
   const start = BigInt(window.address);
@@ -2430,7 +2512,11 @@ function hexPane(window, target) {
         class: "dim",
         text:
           (holes ? ` · ${bytes(holes)} missing from this dump` : " · fully present") +
-          (region?.perms.includes("x") ? " · executable" : ""),
+          (region?.perms.includes("x") ? " · executable" : "") +
+          // The stack window's frames are a page of them when the thread is deep, and an overlay that stopped
+          // at frame 500 without saying so would read as "nothing lives below this" — a claim about the dump
+          // made from the size of one answer.
+          (stackOverlayNote(window) ?? ""),
       }),
     ),
     objects.length ? overlayLegend() : null,
@@ -3755,6 +3841,31 @@ function waitingPane(window, message) {
       h("p", { class: "dim", text: `${window.address} · ${bytes(window.length)} · read on demand, one window at a time` }),
     ),
   );
+}
+
+// Load the next page when the reader gets near the end of what is on screen.
+//
+// An IntersectionObserver rather than a scroll listener: it fires when the sentinel is *near* the viewport
+// (one screenful early, so the wait happens while the reader is still scrolling), it needs no arithmetic about
+// scroll positions, and it stops firing once the element is gone from the tree. The element is recreated by
+// every render, so the observer is not kept — it disconnects as soon as it has fired.
+function watchNear(element) {
+  if (typeof IntersectionObserver !== "function") return;
+  // **Only when there is something to scroll.** A deep stack whose frames are folded (`descend ×30000`) is two
+  // flow steps tall — shorter than the screen — so a sentinel watched by the viewport alone sits "near the
+  // end" for ever and pages the whole stack in the background: measured, it read 8 000 frames unprompted in
+  // the first seconds, which is the run-away this paging exists to prevent (the unpaged request cost 420 146
+  // commands). The reader's click is always there; this is the same action, and it is offered only when
+  // scrolling is what would otherwise reach it.
+  if (document.documentElement.scrollHeight <= window.innerHeight + 600) return;
+  const observer = new IntersectionObserver((entries) => {
+    if (!entries.some((entry) => entry.isIntersecting)) return;
+    observer.disconnect();
+    loadMoreStack();
+  }, { rootMargin: "600px" });
+  observer.observe(element);
+  state.observers = state.observers ?? [];
+  state.observers.push(observer);
 }
 
 // A short name for an address, for log lines: the window's own name when it has one (`heap`, `stack`), else

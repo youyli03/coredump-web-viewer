@@ -709,6 +709,8 @@ class MiTransport(Transport):
         # Keyed the way the question is asked, and cleared with the rest when the session closes.
         self._registers: dict[int, dict[str, Any]] = {}
         self._variables: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self._arguments: dict[tuple[int, int, int], dict[int, list[dict[str, Any]]]] = {}
+        """`(thread, low, high) → the frame arguments of that range`, which is asked for a *page* at a time."""
         self._slots: dict[tuple[int, int], list[dict[str, Any]]] = {}
         self._frame_rows: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
         """`thread → level → {sp, fp}`, asked frame by frame because MI's frame tuple has neither."""
@@ -1052,10 +1054,20 @@ class MiTransport(Transport):
         The `--simple-values` flag is not optional in gdb 13: without it the command is a usage error.
         An aggregate argument (an array) then comes back with a type and **no value at all** — which is
         different from a value that could not be read, and the caller has to keep them apart.
+
+        Cached per *(thread, range)*, because a page of a stack is asked for again every time it is scrolled
+        back to: the core is a snapshot, so the same range has the same arguments, and a repeated `/stack` is
+        the promise `docs/api.md` §4 makes — "the same question must not go back to gdb". Measured, that
+        promise held at **0** commands before arguments were added to a page, and adding them made a repeat cost
+        one command until this cache existed (`tests/api/test_cost.py` is what noticed).
         """
         frames = self._frames(thread_num)
-        self._select_thread(thread_num)
         top = high if high is not None else max(0, len(frames) - 1)
+        key = (thread_num, low, top)
+        cached = self._arguments.get(key)
+        if cached is not None:
+            return {level: [dict(argument) for argument in arguments] for level, arguments in cached.items()}
+        self._select_thread(thread_num)
         results = self._result(self._exec(f"-stack-list-arguments --simple-values {low} {top}"))
 
         out: dict[int, list[dict]] = {}
@@ -1065,7 +1077,8 @@ class MiTransport(Transport):
             if level is None:
                 continue
             out[level] = [_variable(argument, is_arg=True) for argument in frame.get("args") or []]
-        return out
+        self._arguments[key] = out
+        return {level: [dict(argument) for argument in arguments] for level, arguments in out.items()}
 
     def frame_variables(self, thread_num: int, level: int = 0) -> list[dict]:
         """`-stack-list-variables --simple-values` on one selected frame: arguments and locals.
@@ -1829,6 +1842,7 @@ class MiTransport(Transport):
         self._variables.clear()
         self._slots.clear()
         self._frame_rows.clear()
+        self._arguments.clear()
         self._args_loaded.clear()
         self._located.clear()
         self._offsets.clear()
