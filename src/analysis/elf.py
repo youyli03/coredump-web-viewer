@@ -54,11 +54,52 @@ def _nt_file_entries(desc: object) -> list[tuple[int, int, str]]:
     return out
 
 
-def memory_map(core: pathlib.Path, stack_pointer: int | None = None) -> list[dict[str, Any]]:
+def _named_by_library(start: int, end: int, libraries: list[dict[str, Any]]) -> str | None:
+    """The library whose range lands in this region, if gdb could place one there.
+
+    By **overlap**, not containment, and that is a measured choice: the extent gdb reports is the one the
+    module's *sections* span, not its mappings. Measured on the practice bundle, libc's range
+    (`0xe9def2dc7d00`–`0xe9def2ee43b4`) sits strictly inside its `r-xp` region
+    (`0xe9def2da0000`–`0xe9def2f3a000`), so a "region inside range" rule would name nothing at all there. A
+    range that stretches over several mappings names each of them, which is the other half of the same
+    reasoning. Where two modules overlap one region — which happens when gdb's answer for one is stale — the
+    larger overlap wins, and a tie goes to the lower address so the answer does not depend on gdb's order. A
+    library gdb marked `mismatch` — it found a file and said it is the wrong one (`MiTransport.libraries()`) —
+    is skipped outright: a name from the link map is not a location.
+    """
+    best: tuple[int, int] | None = None
+    winner: str | None = None
+    for library in libraries:
+        if library.get("mismatch"):
+            # gdb placed this one from a file it then called the wrong version: the name is from the core's link
+            # map, the address is not, so it names nothing.
+            continue
+        for span in library.get("ranges") or []:
+            low, high = int(span["start"]), int(span["end"])
+            overlap = min(end, high) - max(start, low)
+            if overlap <= 0:
+                continue
+            if best is None or (overlap, -low) > best:
+                best, winner = (overlap, -low), str(library.get("name") or "") or None
+    return winner
+
+
+def memory_map(
+    core: pathlib.Path,
+    stack_pointer: int | None = None,
+    libraries: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Every mapped range in the dump, in address order.
 
     `stack_pointer` (when given) marks the one region a thread's stack lives in, because a stack has no name of
     its own in the file — the kernel's `[stack]` is not written to the core as a path.
+
+    `libraries` is gdb's own list of the dump's shared objects (`MiTransport.libraries()`), and it is a second
+    naming source, not a decoration: a core that carries **no `NT_FILE` note** — which is what a QNX dump looks
+    like — leaves every region anonymous here, and gdb can still name the ones whose files it could read. Each
+    region records which source named it, `"nt_file"` or `"gdb"`, because the two are worth different amounts
+    of trust: one is the kernel's own record written into the dump, the other is gdb's reconstruction from the
+    link map, and a region neither source knows stays `anon`.
     """
     from elftools.elf.elffile import ELFFile
 
@@ -80,6 +121,10 @@ def memory_map(core: pathlib.Path, stack_pointer: int | None = None) -> list[dic
                 continue
             end = start + size
             path = next((name for low, high, name in files if low <= start < high), None)
+            source = "nt_file" if path else None
+            if path is None and libraries:
+                path = _named_by_library(start, end, libraries)
+                source = "gdb" if path else None
             regions.append(
                 {
                     "start": hex(start),
@@ -88,6 +133,7 @@ def memory_map(core: pathlib.Path, stack_pointer: int | None = None) -> list[dic
                     "perms": _perms(int(segment["p_flags"])),
                     "offset": int(segment["p_offset"]),
                     "path": path,
+                    "source": source,
                     "kind": None if path else ("stack" if stack_pointer and start <= stack_pointer < end else "anon"),
                 }
             )

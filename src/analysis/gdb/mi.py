@@ -217,6 +217,7 @@ _LWP = re.compile(r"\(\s*LWP\s+(\d+)\s*\)")
 _TRAILING_INT = re.compile(r"(\d+)\s*\)?\s*$")
 _HEX_TAIL = re.compile(r"0x[0-9a-fA-F]+\s*\)?\s*$")
 _NO_SUCH_COMMAND = re.compile(r"undefined mi command|no such command|not a mi command|usage:", re.I)
+_MISMATCH = re.compile(r"wrong library or version mismatch", re.I)
 
 
 def _tid_from_target_id(target_id: str | None) -> int | None:
@@ -718,6 +719,8 @@ class MiTransport(Transport):
         """`(type, field) → byte offset`, asked once per session — a layout does not change."""
         self._sizes: dict[str, int | None] = {}
         """`type → sizeof`, likewise; `None` remembers a type gdb could not spell."""
+        self._libraries: list[dict[str, Any]] | None = None
+        """The dump's shared objects, merged from both of gdb's answers about them. See `libraries()`."""
 
     # --- command line ------------------------------------------------------------------ #
     def argv_for(self, interpreter: str) -> list[str]:
@@ -899,6 +902,112 @@ class MiTransport(Transport):
         return self._probe_message(command) is None
 
     # --- operations -------------------------------------------------------------------- #
+    def libraries(self) -> list[dict[str, Any]]:
+        """Every shared object gdb knows this dump had, with whatever it can place.
+
+        Asked of gdb rather than read from the core because the two disagree in exactly the interesting case:
+        the core's `NT_FILE` note names a region, and a core **without** that note (a QNX dump is the one this
+        matters for) leaves `analysis/elf.py` with ranges and no names at all. gdb still knows the link map, so
+        it can still name them.
+
+        Two sources, and they are not the same answer:
+
+        - the `=library-loaded` notifications gdb emits while it reads a core — names, and `ranges` when gdb
+          could place the object;
+        - `-file-list-shared-libraries` — the same names, plus the host file when gdb found one.
+
+        Merged by target name, because either half can be the one that knows where an object lives: measured on
+        `core_linux64_no_ntfile.elf`, the notification for `libc.so.6` carried `ranges=[{}]` while ld.so's
+        carried a real span, and `-file-list-shared-libraries` behaves the same way for the same dump. A range
+        appears only for an object whose **file** gdb could open — measured on the practice bundle, where
+        naming the bundle's `sysroot` is what turns `ranges=[{}]` into a real extent for libc. And the extent
+        gdb reports is the one its sections span, not the module's whole mapping: for that same core, libc's
+        range sits strictly inside its `r-xp` region. So a region is named from this by **overlap**, which
+        `analysis/elf.py` is where the reader finds spelled out.
+
+        An object whose file gdb **found but rejected** is still named here and is marked `mismatch`, which is
+        the difference between a name and a location. Measured with no `sysroot` named: a cross gdb finds its
+        own toolchain's ld.so for a core from another distribution, reports a range for it, and says in the same
+        breath
+        `warning: .dynamic section for "…/sysroot/lib/ld-linux-aarch64.so.1" is not at the expected address
+        (wrong library or version mismatch?)`. The name comes from the core's link map and is right; the range
+        was computed from a file that is not this dump's, so `analysis/elf.py` refuses to place anything by it.
+        """
+        if self._libraries is not None:
+            return self._libraries
+
+        by_name: dict[str, dict[str, Any]] = {}
+
+        def absorb(raw: dict[str, Any], source: str) -> None:
+            name = raw.get("target-name") or raw.get("id")
+            if not name:
+                return
+            entry = by_name.setdefault(
+                str(name),
+                {
+                    "name": str(name),
+                    "host_name": None,
+                    "symbols_loaded": False,
+                    "ranges": [],
+                    "sources": [],
+                },
+            )
+            host = raw.get("host-name")
+            if host and str(host) != entry["name"]:
+                # Only when it differs: a host name equal to the target name means gdb did *not* find the
+                # file, and recording that as a location would claim it had.
+                entry["host_name"] = str(host)
+            if str(raw.get("symbols-loaded") or "0") not in ("", "0", "None"):
+                entry["symbols_loaded"] = True
+            for span in raw.get("ranges") or []:
+                low, high = _hex_int(span.get("from")), _hex_int(span.get("to"))
+                if low is None or high is None or high <= low:
+                    continue
+                if {"start": low, "end": high} not in entry["ranges"]:
+                    entry["ranges"].append({"start": low, "end": high})
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+
+        # The startup records are raw MI lines, kept as diagnostics; parsing them here is what makes the
+        # `=library-loaded` half of the answer available at all.
+        for line in self.startup_records:
+            try:
+                record = parse_record(line)
+            except MiParseError:
+                continue
+            if record.get("kind") == "notify" and record.get("class") == "library-loaded":
+                absorb(record.get("results") or {}, "notification")
+
+        try:
+            results = self._result(self._exec("-file-list-shared-libraries", timeout=self.probe_timeout_s))
+        except GdbError as exc:
+            # A gdb without the command is not an error about this dump: the notifications already answered.
+            note = f"gdb could not list the dump's shared libraries: {exc}"
+            if note not in self.warnings and len(self.warnings) < 100:
+                self.warnings.append(note)
+        else:
+            for raw in results.get("shared-libraries") or []:
+                absorb(raw, "list")
+
+        # Read *after* the command, because that command is what makes gdb try the files: the warning above
+        # appears while it answers, not at startup.
+        rejected = self._rejected_files()
+        for entry in by_name.values():
+            entry["mismatch"] = any(
+                candidate and candidate in rejected for candidate in (entry.get("host_name"), entry["name"])
+            )
+
+        self._libraries = [by_name[name] for name in by_name]
+        return self._libraries
+
+    def _rejected_files(self) -> set[str]:
+        """The files gdb found and said do not match this dump, extracted from its own warnings."""
+        out: set[str] = set()
+        for line in self.warnings:
+            if _MISMATCH.search(line):
+                out.update(re.findall(r'"([^"]+)"', line))
+        return out
+
     def capabilities(self) -> Capabilities:
         if self._caps is not None:
             return self._caps

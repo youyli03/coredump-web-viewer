@@ -152,6 +152,42 @@ Naming the binary (`exe`) — and its module directory (`solib_search_path`) —
 is why those are session inputs rather than assumptions. `tests/api/test_foreign.py` builds this shape from the
 x86-64 fixture (patching the note's type) so it is pinned without needing a QNX core.
 
+**gdb is the second naming source, and a name is not a location.** The core's note is the kernel's own record;
+gdb's library list is a reconstruction from the link map, and it is asked for once per session
+(`MiTransport.libraries()`, one `-file-list-shared-libraries` plus the `=library-loaded` notifications from
+startup). Every region says which source named it — `regions[].source` is `"nt_file"`, `"gdb"` or `null` — and
+`memory_map.libraries` reports what gdb knew, including what it could **not** place:
+
+```json
+"memory_map": {
+  "source": "core_pt_load+nt_file+gdb",
+  "regions": [{"start": "0xe9def2da0000", "perms": "r-xp", "path": "/lib/aarch64-linux-gnu/libc.so.6",
+               "source": "gdb", "kind": "libc.so.6"}],
+  "libraries": [{"name": "/lib/aarch64-linux-gnu/libc.so.6", "host_name": "…/sysroot/lib/aarch64-linux-gnu/libc.so.6",
+                 "symbols_loaded": true, "mismatch": false, "ranges": [{"start": "0xe9def2dc7d00",
+                 "end": "0xe9def2ee43b4"}], "sources": ["notification", "list"], "regions": 1}]
+}
+```
+
+Three measured facts decide this shape, all on the practice bundle's `crash_target` core with its note patched
+out (28 regions, 0 named):
+
+| | |
+|---|---|
+| a range exists only for an object whose **file** gdb could read | with the bundle's `sysroot` and `solib_search_path`: **2 of 28 regions named** (`libc.so.6`'s and `libplugin.so`'s `r-xp` regions, `source: "gdb"`), and libc's entry carries a range and a `host_name`. With no sysroot: **0 named** |
+| the extent gdb reports is its **sections'**, not the module's mapping | libc's range `0xe9def2dc7d00`–`0xe9def2ee43b4` sits strictly **inside** its `r-xp` region `0xe9def2da0000`–`0xe9def2f3a000`, so the naming rule is *overlap* — a "region inside range" rule would name nothing here. What gdb places is therefore each module's code region, and the module's other mappings stay `anon` |
+| a name may arrive without a usable address | with no sysroot, a cross gdb finds **its own toolchain's** ld.so for this core and says `warning: .dynamic section for "…/sysroot/lib/ld-linux-aarch64.so.1" is not at the expected address (wrong library or version mismatch?)` — while still reporting a range from it. That library is reported with `"mismatch": true` and names no region: the name is from the link map and is right, the location is not |
+
+The same measured on the x86-64 fixture: gdb names `libc.so.6` and `ld-linux-x86-64.so.2` and places **neither**
+— ld.so's range (`0x7fa4599760d8`–`0x7fa4599949e8`) falls in a **hole** between two of that dump's mappings, and
+the file it found for it is one it rejects. So a caller asking "which region is this object?" must read
+`libraries[].regions`, not infer it from a name being present.
+
+What this does **not** do is guess: a library that gdb could not place, or placed from a file it rejected, names
+nothing, and the region stays `anon` with gdb's own warning in `session.warnings`. Identifying a region by its
+**content** — matching its bytes against the files this session was given — is a separate and explicit
+inference, and it is what covers the case gdb cannot: a module whose file gdb never found.
+
 ### 3.2 The memory window: what is there, what is not, and what was never asked about
 
 `GET …/memory` answers three states, and they must not be confused — `requirements.md` C3 asks for the bytes

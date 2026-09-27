@@ -324,6 +324,37 @@ def _first_address(value: str) -> int:
     return int(match.group(0), 16)
 
 
+def _libraries_payload(libraries: list[dict], regions: list[dict]) -> list[dict]:
+    """gdb's library list, as the API reports it: names, where gdb found each file, and what it placed.
+
+    `regions` is how many ranges of the map this object ended up naming, which is the only part of this list a
+    reader can act on — a library with no ranges is a name gdb knows and a location it does not, and that is
+    exactly the case `docs/api.md` §3.1a exists for.
+    """
+    out = []
+    for library in libraries:
+        name = str(library.get("name") or "")
+        spans = [
+            {"start": hex(int(span["start"])), "end": hex(int(span["end"]))}
+            for span in library.get("ranges") or []
+        ]
+        placed = sum(
+            1 for region in regions if region.get("source") == "gdb" and region.get("path") == name
+        )
+        out.append(
+            {
+                "name": name,
+                "host_name": library.get("host_name"),
+                "symbols_loaded": bool(library.get("symbols_loaded")),
+                "mismatch": bool(library.get("mismatch")),
+                "ranges": spans,
+                "sources": list(library.get("sources") or []),
+                "regions": placed,
+            }
+        )
+    return out
+
+
 def _region_name(regions: list[dict], address: int) -> str:
     """A region's name, in the map's own vocabulary: the file if it has one, otherwise its kind.
 
@@ -870,7 +901,12 @@ def build_summary(
     # The regions come from the core's own segments and NT_FILE note, not from gdb, so they are known before
     # anything is read — which is what lets the stack window be the whole mapping rather than a guess at how
     # much of it to show.
-    regions = memory_map(core, stack_pointer)
+    #
+    # gdb is asked for its library list as well, and that is the *second* naming source: a core whose NT_FILE
+    # note is missing or does not cover a region — the QNX shape — gets named wherever gdb could place the
+    # object from the link map. One command, once per session, and each region says which source named it.
+    libraries = transport.libraries()
+    regions = memory_map(core, stack_pointer, libraries)
     # And the shape those bytes have to be read *in*: the core's own architecture, word size and byte order,
     # from the same ELF header the regions came from. They travel with the map rather than being re-derived per
     # window, because they are three facts about the whole dump and decoding needs all three to be right.
@@ -970,7 +1006,12 @@ def build_summary(
         },
         "threads": threads,
         "detail": detail,
-        "memory_map": {"source": "core_pt_load+nt_file", "regions": regions, **shape},
+        "memory_map": {
+            "source": "core_pt_load+nt_file+gdb",
+            "regions": regions,
+            "libraries": _libraries_payload(libraries, regions),
+            **shape,
+        },
         "memory": memory,
         "typed": {"objects": typed},
         "stack": stack,

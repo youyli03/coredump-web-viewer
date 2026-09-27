@@ -4511,6 +4511,7 @@ function memoryView() {
       ? h(
           "table",
           { class: "regions" },
+          libraryNote(regions),
           h("thead", {}, h("tr", {}, ["start", "end", "perm", "size", "object"].map((title) => h("th", { text: title })))),
           h(
             "tbody",
@@ -4532,18 +4533,60 @@ function memoryView() {
                 h("td", { text: item.end }),
                 h("td", { class: "perm", text: item.perms }),
                 h("td", { class: "size", text: bytes(item.size) }),
-                h("td", {
-                  class: item.path ? "" : "anon",
-                  // No file *and* no access are two different facts, and the reserved ranges are 64 MB of this
-                  // core: printing `[anon]` for them said "anonymous memory" about pages with no contents.
-                  text: leaf(item.path) ?? (regionKind(item) === "reserved" ? "[reserved]" : `[${item.kind}]`),
-                }),
+                h(
+                  "td",
+                  {
+                    class: item.path ? "" : "anon",
+                    // No file *and* no access are two different facts, and the reserved ranges are 64 MB of this
+                    // core: printing `[anon]` for them said "anonymous memory" about pages with no contents.
+                    text: leaf(item.path) ?? (regionKind(item) === "reserved" ? "[reserved]" : `[${item.kind}]`),
+                  },
+                  // Which source named this region, in the same cell as the name. The core's own NT_FILE note is
+                  // the kernel's record; a name gdb reconstructed from the link map is a weaker claim and says so.
+                  item.source === "gdb"
+                    ? h(
+                        "span",
+                        {
+                          class: "src",
+                          title:
+                            "named by gdb, from the dump's link map — the core's own NT_FILE note named nothing here",
+                        },
+                        "gdb",
+                      )
+                    : null,
+                ),
               ),
             ),
           ),
         )
       : body,
   );
+}
+
+// What gdb knows about this dump's objects and could not place. It is the answer to "why is this region still
+// `[anon]` when the object clearly has a name?", and on a core whose NT_FILE note named nothing — the QNX shape
+// — it is where the names appear at all. Nothing here is a region name: a library with `regions: 0` named no
+// mapping, and one whose file gdb called the wrong version names none by design.
+function libraryNote(regions) {
+  const libraries = state.data?.memory_map?.libraries ?? [];
+  // Shown only where the dump's own note named nothing: a core that names its files itself does not need a list
+  // of what gdb could not place, and the same name in that list and in the table would read as a contradiction.
+  if (!libraries.length || regions.some((region) => region.source === "nt_file")) return null;
+  const unplaced = libraries.filter((library) => !library.regions);
+  if (!unplaced.length) return null;
+  const placed = libraries.length - unplaced.length;
+  const parts = unplaced.map((library) => {
+    const name = leaf(library.name) ?? library.name;
+    if (library.mismatch) return `${name} (gdb found a file it calls the wrong version)`;
+    if (!library.ranges?.length) return `${name} (no file for it was reachable, so gdb cannot place it)`;
+    return `${name} (its range lands outside this dump's mappings)`;
+  });
+  return h("caption", {
+    text:
+      `no mapping in this dump names a file; gdb knows ${libraries.length} object${libraries.length === 1 ? "" : "s"}` +
+      (placed ? ` and placed ${placed}` : "") +
+      ` — it cannot place ${parts.join(", ")}`,
+  });
 }
 
 // --------------------------------------------------------------------------- //
