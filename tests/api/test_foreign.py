@@ -20,6 +20,7 @@ unless one has been fetched, and says how — `AGENTS.local.md` has the command.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 
@@ -34,7 +35,19 @@ FOREIGN = ROOT / "tmp" / "cores"
 """Where a fetched core of another architecture is looked for. `tmp/` is scratch: absent, and every test here
 that needs one skips."""
 
-X86_64_GDB = pathlib.Path(shutil.which("x86_64-linux-gnu-gdb") or "/opt/homebrew/bin/x86_64-linux-gnu-gdb")
+X86_64_GDB_NAME = "x86_64-linux-gnu-gdb"
+"""The gdb that reads the x86-64 fixtures — resolved from the environment or `PATH`, never as an absolute path.
+
+It used to fall back to an absolute path under one machine's package manager, which is a spelling of a tool a
+reader may have anywhere — the same mistake this repository already removed once (`2170bda` stopped hardcoding
+the aarch64 cross gdb's path, for the same reason). `CDWV_GDB_X86_64` names it when it is not
+on `PATH` — the variable the app reads in `src/config.py` is `CDWV_GDB` for *the* gdb a session uses, so a
+second one needs its own name rather than an overload — and without either the tests that need it skip.
+"""
+
+
+def _x86_64_gdb() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("CDWV_GDB_X86_64") or (shutil.which(X86_64_GDB_NAME) or X86_64_GDB_NAME))
 
 
 def _portable_gdb() -> pathlib.Path:
@@ -182,8 +195,8 @@ def test_a_core_that_names_no_files_says_so_instead_of_showing_an_empty_page(tmp
     that this viewer has no symbol table to read. That is what this pins.
     """
     fixture = FOREIGN / "core_linux64.elf"
-    if not fixture.is_file() or not X86_64_GDB.exists():
-        pytest.skip(f"needs {fixture} and a matching gdb ({X86_64_GDB})")
+    if not fixture.is_file() or not _x86_64_gdb().exists():
+        pytest.skip(f"needs {fixture} and a matching gdb ({_x86_64_gdb()})")
 
     import dataclasses
 
@@ -202,7 +215,7 @@ def test_a_core_that_names_no_files_says_so_instead_of_showing_an_empty_page(tmp
     )
 
     app = create_app(
-        dataclasses.replace(CONFIG, gdb_path=str(X86_64_GDB)),
+        dataclasses.replace(CONFIG, gdb_path=str(_x86_64_gdb())),
         root=ROOT,
         state_path=tmp_path,
         bundle=tmp_path / "no-bundle",
@@ -252,7 +265,7 @@ def test_a_core_of_another_architecture_needs_its_own_gdb(tmp_path: pathlib.Path
     core = FOREIGN / "core_linux64.elf"
     if not core.is_file():
         pytest.skip(f"no foreign core to read: fetch one into {FOREIGN} (see this test's docstring)")
-    if not _portable_gdb().exists() or not X86_64_GDB.exists():
+    if not _portable_gdb().exists() or not _x86_64_gdb().exists():
         pytest.skip("needs both the aarch64 and the x86_64 cross gdb")
 
     def open_with(gdb: pathlib.Path) -> dict:
@@ -276,7 +289,7 @@ def test_a_core_of_another_architecture_needs_its_own_gdb(tmp_path: pathlib.Path
 
     # The right gdb: threads, a stack, a memory map from the core's own NT_FILE note — and no symbols, because
     # this dump arrived without its binary.
-    right = open_with(X86_64_GDB)
+    right = open_with(_x86_64_gdb())
     assert right["state"] == "ready", right.get("error")
     assert right["exe"] is None
     summary = right["summary"]
