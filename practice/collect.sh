@@ -70,6 +70,17 @@ echo "== building the optimised sample (variables in registers) =="
 # Frame pointers are kept so the stack still walks.
 ( cd "$out" && cc -g -O2 -fno-omit-frame-pointer -o opt_target "$src/opt_target.c" )
 
+if [ "${HEAVY:-0}" = "1" ]; then
+  echo "== building the heavy target (scale: threads, depth, memory) =="
+  # Opt-in, because it is the one target whose *cost* is the point: a gigabyte of core and tens of thousands of
+  # frames. -O0 and kept frame pointers so the recursion is real rather than rolled into a loop, and the thread
+  # stack is 32 MB so the depth fits comfortably instead of becoming a stack overflow. THREADS/DEPTH/HEAP_MB are
+  # overridable so the same scenario can be run small on a small machine.
+  ( cd "$out" && cc -g -O0 -fno-omit-frame-pointer \
+      -DTHREADS="${HEAVY_THREADS:-48}" -DDEPTH="${HEAVY_DEPTH:-30000}" -DHEAP_MB="${HEAVY_HEAP_MB:-1024}" \
+      -o heavy_target "$src/heavy_target.c" -ldl -lpthread )
+fi
+
 echo "== building the register-snapshot sample =="
 # Also -O2, and for the same reason in reverse: a callee-saved register is only saved when something is kept
 # in it, and at -O0 nothing is. This target is about what a stack holds when the *code* puts registers there
@@ -97,6 +108,14 @@ collect opt_target || true
 echo "== running the register-snapshot sample (it is supposed to crash) =="
 collect snap_target || true
 
+if [ -e "$out/heavy_target" ]; then
+  echo "== running the heavy target (it is supposed to crash, and it takes a moment) =="
+  # The deep recursion runs on the main thread, so the *process* stack limit is what has to hold 30 000
+  # frames. Raised here rather than in the target because it is a property of the run, not of the program.
+  ulimit -s 16384 || true
+  collect heavy_target || true
+fi
+
 echo "== collecting a sysroot =="
 while read -r lib; do
   [ -n "$lib" ] || continue
@@ -104,6 +123,7 @@ while read -r lib; do
   mkdir -p "$(dirname "$dest")"
   cp -Lf "$lib" "$dest" 2>/dev/null || true
 done < <( { ldd "$out/$prog"; ldd "$out/libplugin.so"; ldd "$out/opt_target"; ldd "$out/snap_target"; \
+            [ -e "$out/heavy_target" ] && ldd "$out/heavy_target"; \
             for mode in $smash_modes; do ldd "$out/smash_$mode"; done; } 2>/dev/null \
           | awk '/=> \// {print $3} /^\// {print $1}' | sort -u )
 
@@ -130,7 +150,7 @@ done < <( { ldd "$out/$prog"; ldd "$out/libplugin.so"; ldd "$out/opt_target"; ld
   # (a fault inside a handler, a deliberately smashed frame record) are exactly what these lines show.
   if command -v gdb >/dev/null 2>&1; then
     for exe in "$out/$prog" "$out/snap_target" "$out/opt_target" \
-               "$out/smash_ra" "$out/smash_fp" "$out/smash_data"; do
+               "$out/smash_ra" "$out/smash_fp" "$out/smash_data" "$out/heavy_target"; do
       [ -e "$exe" ] || continue
       crash_core="$(ls -1t "$exe".*.core 2>/dev/null | head -n1 || true)"
       [ -n "$crash_core" ] || continue

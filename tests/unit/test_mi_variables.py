@@ -128,17 +128,22 @@ def test_frame_variables_include_locals() -> None:
 
 
 def test_frame_variables_select_the_frame_they_are_about() -> None:
-    """The frame selection is transport state, so asking about frame 1 has to move it there."""
+    """The frame selection is transport state, so asking about a frame has to move it there — frame 0 included.
+
+    Frame 0 used to be free, because `-thread-select` had already put gdb on it as a side effect. Skipping that
+    redundant selection (see `_select_thread`: it saves a 536 ms unwind *per frame* on a deep stack) is what
+    stopped "the current frame" from meaning "frame 0" — measured, a level-0 query after a deep one answered
+    with the deep frame's variables. Whoever asks now names the frame.
+    """
     commands: list[str] = []
     transport = _bare_transport(commands)
     transport._select_thread = lambda thread_num: None  # type: ignore[method-assign]
 
     transport.frame_variables(1, 3)
     assert "-stack-select-frame 3" in commands
-    # Frame 0 is the default and needs no selection at all.
     commands.clear()
     transport.frame_variables(1)
-    assert not [c for c in commands if c.startswith("-stack-select-frame")]
+    assert "-stack-select-frame 0" in commands, "the frame is named, not assumed to still be 0"
 
 
 @pytest.mark.parametrize("level", [0, 1])

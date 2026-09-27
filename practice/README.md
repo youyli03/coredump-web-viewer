@@ -116,6 +116,37 @@ kernel caps that at 15: `optimized_target` produced `optimized_targe.<time>.<pid
 tool that looks a core up by program name then failed to find — silently. `opt_target` is named for that
 reason, and `collect.sh` warns when a target produces no core instead of shipping a bundle without it.
 
+## The heavy sample: scale instead of awkwardness
+
+Everything above is *awkward*. `heavy_target` is the one that is **big**, because size is a claim the viewer
+makes — "cores are GB-scale and a stack can have tens of thousands of frames" (`docs/requirements.md` §5) — and
+a core the size of a small machine's memory is the only thing that can test it. It is opt-in, since its cost is
+the point:
+
+```bash
+HEAVY=1 bash practice/collect.sh                                  # 48 threads, 30 000 frames, 1 GB of heap
+HEAVY=1 HEAVY_DEPTH=60000 HEAVY_HEAP_MB=2048 bash practice/collect.sh
+```
+
+| in the target | measured on the practice core |
+|---|---|
+| 48 threads in four states (one holds a mutex, the rest block on it, some sleep, some work) | 48 threads in the dump, and the crash frame's own thread is at the **bottom** of the stack |
+| 30 000 frames of recursion, each writing a 64-byte buffer | the crashed thread reports **30 002 frames** |
+| 1 GB of touched, live heap (never freed) | the core is **1.13 GB**, and the largest mapping is **1.07 GB** |
+| a crash at the bottom, dereferencing `0xdead0000dead0000` | the same recognisable "not in this dump" answer the other targets produce |
+
+**Two numbers here are surprising, and both are about the kernel rather than about us.** An anonymous mapping
+is written to the core **in full**, whether or not its pages were ever touched — so the 48 helper threads ask
+for a 1 MB stack each rather than a comfortable 32 MB, because 48 × 32 MB would have put 1.5 GB of zeroes into
+the dump and drowned the heap this sample is about. The same rule is why `crash_target`'s own core grows from
+25 MB to 50 MB when the collector raises `ulimit -s` for this scenario: the main thread's stack is a mapping
+too, and it is dumped whole.
+
+The depth is real rather than nominal for the same reason: the recursion is built `-O0` with frame pointers, so
+30 000 calls are 30 000 frames, and the fault is at the deepest one. That is what makes a *window* of the stack
+the interesting question — asking for twenty frames at offset 20 000 is a different problem from asking for the
+first twenty, and it is the problem this sample exists to pose.
+
 ## Extending it
 
 Add a new scenario as `practice/src/<name>.c` plus a branch in `collect.sh`, and keep every scenario

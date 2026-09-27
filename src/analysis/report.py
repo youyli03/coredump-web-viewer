@@ -597,7 +597,11 @@ def stack_detail(
         "total": total,
         "offset": first,
         "limit": limit,
-        "truncated": last < total - 1,
+        # "Is this window the whole stack?" — either side counts. `last < total - 1` alone answered "not
+        # truncated" for a window at the *end* of a 30 000-frame stack, which reads as "this is all of it"
+        # when 30 000 frames are above it. Which side is missing is derivable (offset says how many are above,
+        # and total - offset - len(frames) how many are below), so one flag is enough as long as it is honest.
+        "truncated": first > 0 or last < total - 1,
     }
 
 

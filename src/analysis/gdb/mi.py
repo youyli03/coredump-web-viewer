@@ -549,6 +549,9 @@ class MiTransport(Transport):
         self._caps: Capabilities | None = None
         self._crashed_thread: int | None = None
         self._register_names: list[str] | None = None
+        self._selected_thread: int | None = None
+        self._selected_frame: int | None = None
+        """Where gdb is, thread *and* frame, so a selection is not repeated. See `_select_frame`."""
         self._stacks: dict[int, list[dict[str, Any]]] = {}
         self._args_loaded: set[int] = set()
         """Threads whose frame arguments are already in the cached frames."""
@@ -929,9 +932,7 @@ class MiTransport(Transport):
         cached = self._variables.get(key)
         if cached is not None:
             return [dict(variable) for variable in cached]
-        self._select_thread(thread_num)
-        if level:
-            self._result(self._exec(f"-stack-select-frame {level}"))
+        self._select_frame(thread_num, level)
         results = self._result(self._exec("-stack-list-variables --simple-values"))
         variables = [_variable(raw) for raw in results.get("variables") or []]
         self._variables[key] = variables
@@ -955,7 +956,7 @@ class MiTransport(Transport):
             return [dict(row) for row in cached]
         # One frame further up than asked for: a frame ends where its caller's stack begins, so the last
         # range in the slice needs the `sp` of the frame after it.
-        located = self._frame_locations(thread_num, min(top + 1, len(frames) - 1))
+        located = self._frame_locations(thread_num, first, min(top + 1, len(frames) - 1))
 
         out: list[dict[str, Any]] = []
         for index in range(first, top + 1):
@@ -1033,6 +1034,12 @@ class MiTransport(Transport):
         frames = self.stack_frames(thread_num, low=level, high=level)
         if not frames:
             raise GdbError(f"thread {thread_num} has no frame {level}")
+        # The frame is selected **here**, not left to `frame_variables` below. That call answers from its cache
+        # without touching gdb, and everything after it — `&(name)`, `info address` — is evaluated in whatever
+        # frame gdb happens to be on. Measured: an `-O2` frame's register-resident variable came back
+        # "unavailable" because its location was asked in the frame *above* it, which is the parent's `pc`
+        # range and therefore a different answer, or none.
+        self._select_frame(thread_num, level)
         start = _int_literal(frames[0]["start"])
         end = _int_literal(frames[0]["end"])
         pc = _int_literal(frames[0]["pc"])
@@ -1103,24 +1110,31 @@ class MiTransport(Transport):
         raw = chunk["chunks"][0]["bytes"] if chunk.get("chunks") else ""
         return _frame_record(frame.get("arch"), fp, bytes.fromhex(raw))
 
-    def _frame_locations(self, thread_num: int, upto: int) -> dict[int, dict[str, int | None]]:
-        """`sp` and `fp` of every frame up to `upto`, asked frame by frame.
+    def _frame_locations(self, thread_num: int, first: int, upto: int) -> dict[int, dict[str, int | None]]:
+        """`sp` and `fp` of the frames in `[first, upto]`, asked frame by frame.
 
-        There is no cheaper way: an MI frame tuple carries `addr` (the pc) and neither `sp` nor `fp`. That
-        is one `-stack-select-frame` and two evaluations per frame, so it is fetched lazily up to what was
-        asked for and cached per thread — the range of a frame needs its caller's `sp`, and a UI asks
-        about a window of frames rather than the whole stack.
+        There is no cheaper way: an MI frame tuple carries `addr` (the pc) and neither `sp` nor `fp`. That is
+        one `-stack-select-frame` and two evaluations per frame, so it is fetched lazily and cached per level —
+        the range of a frame needs *its caller's* `sp`, which is why `upto` is one frame above the window.
+
+        **It starts at `first`, not at frame 0**, and that is not a micro-optimisation. Measured on a core with
+        a 30 000-frame stack: asking for twenty frames at offset 20 000 walked twenty thousand of them first —
+        45 321 gdb commands and **52 seconds** for one scroll, where the window itself is twenty frames. A
+        stack that deep is the case requirements §5 names, and a viewer whose cost is O(depth) per scroll has
+        no answer for it.
         """
         cached = self._located.setdefault(thread_num, {})
         frames = self._frames(thread_num)
         self._select_thread(thread_num)
         for frame in frames:
             level = frame["level"]
-            if level is None or level > upto:
+            if level is None or level < first:
+                continue
+            if level > upto:
                 break
             if level in cached:
                 continue
-            self._result(self._exec(f"-stack-select-frame {level}"))
+            self._select_frame(thread_num, level)
             cached[level] = {
                 "sp": _int_literal(self._expression_text("$sp")),
                 "fp": _int_literal(self._expression_text("$fp")),
@@ -1140,7 +1154,7 @@ class MiTransport(Transport):
         None means gdb did not give one: an architecture this gdb cannot read, or a core whose registers are
         not in it. That is an answer to report, not an exception to raise from deep inside a parser.
         """
-        located = self._frame_locations(thread_num, 0)
+        located = self._frame_locations(thread_num, 0, 0)
         return (located.get(0) or {}).get("sp")
 
     def registers(self, thread_num: int) -> dict[str, str]:
@@ -1158,7 +1172,9 @@ class MiTransport(Transport):
             names = self._result(self._exec("-data-list-register-names")).get("register-names") or []
             self._register_names = [str(name) for name in names]
 
-        self._select_thread(thread_num)
+        # Registers in gdb belong to the *selected frame*, so frame 0 is named rather than assumed: a thread's
+        # registers are the innermost frame's, and after a deep query the current frame is not that.
+        self._select_frame(thread_num, 0)
         values = self._result(self._exec("-data-list-register-values x")).get("register-values") or []
 
         out: dict[str, str] = {}
@@ -1289,7 +1305,14 @@ class MiTransport(Transport):
         """One expression, one value, one DWARF type.
         Built on a floating variable rather than `-data-evaluate-expression` because only the variable
         form answers with a `type=` as well as a `value=`, and the type is what the typed view is for.
+
+        **An expression is evaluated in a scope, and gdb's scope is the frame it is on.** A name from the crash
+        frame (`head`, the root of the demo's typed walk) is only in scope there, so this evaluates in the
+        innermost frame of the selected thread — which is where `-thread-select` used to leave gdb as a side
+        effect, and which is now said out loud (one `-stack-select-frame 0`, skipped when we are already there).
+        A name from an *outer* frame needs that frame selected, which is what `frame_variables` does.
         """
+        self._expression_scope()
         created = self._var_create(expression)
         try:
             summary = _var_summary(expression, created)
@@ -1302,6 +1325,8 @@ class MiTransport(Transport):
     def expand(self, expression: str) -> dict[str, Any]:
         """One level of children — exactly what one click on a pointer should cost.
 
+        Evaluated in the innermost frame of the selected thread, like `evaluate`; see the note there.
+
         Each child comes back with the expression that expands *it*, so walking a chain is: expand what
         the user clicked, render the children, offer the ones that have children as clicks again.
 
@@ -1312,6 +1337,7 @@ class MiTransport(Transport):
         A field whose address cannot be taken (a bit-field, or a type gdb cannot spell as C) keeps
         `offset: None` rather than a guess.
         """
+        self._expression_scope()
         created = self._var_create(expression)
         name = created.get("name")
         try:
@@ -1416,15 +1442,51 @@ class MiTransport(Transport):
         if text not in self.warnings and len(self.warnings) < 100:
             self.warnings.append(text)
 
+    def _expression_scope(self) -> None:
+        """Put gdb back on the innermost frame of the selected thread, for an expression to be evaluated in."""
+        if self._selected_thread is not None:
+            self._select_frame(self._selected_thread, 0)
+
+    def _select_frame(self, thread_num: int, level: int) -> None:
+        """Put gdb on one frame of one thread — the *pair*, because a thread switch resets the frame.
+
+        `-thread-select` has a side effect the rest of this module used to lean on: it selects frame 0. So
+        `frame_variables` skipped its `-stack-select-frame` at level 0 and asked "the current frame's variables"
+        — correct only as long as every call re-selected the thread. Once the redundant selection was skipped
+        (see `_select_thread`), a level-0 query after a deep one answered with the deep frame's variables; the
+        practice suite caught it immediately with `KeyError: 'target'` on an `-O2` frame.
+
+        Naming the frame explicitly is also what makes the *cache* of that selection safe: gdb's registers and
+        variables are properties of the selected frame, not of the thread.
+        """
+        if self._selected_thread == thread_num and self._selected_frame == level:
+            return
+        self._select_thread(thread_num)
+        self._result(self._exec(f"-stack-select-frame {level}"))
+        self._selected_frame = level
+
     def _select_thread(self, thread_num: int) -> None:
-        """Switching threads is what makes backtrace/registers meaningful; a bad number is a real error."""
+        """Switching threads is what makes backtrace/registers meaningful; a bad number is a real error.
+
+        **Selecting a thread that is already selected is skipped, and that is a performance fix with a
+        measured cause.** `-thread-select` resets gdb's frame cache, so the next `-stack-select-frame N` pays
+        the whole unwind again: on a core with 30 000 frames, selecting frame 20 000 costs 5 ms while the
+        thread stays put and **536 ms** after a re-selection. Every per-frame query used to re-select, so a
+        twenty-frame window at that depth took 11.9 seconds — nearly all of it this one reset, once per frame.
+        Nothing else in this transport switches threads, so the remembered number stays true.
+        """
+        if self._selected_thread == thread_num:
+            return
         records = self._exec(f"-thread-select {thread_num}")
         results = self._result(records)
         # gdb 13 answers `^done,new-thread-id="3"`; older ones may say nothing useful. Either way, a
         # refused selection raises above, so nothing has to be interpreted here.
         _ = results
+        self._selected_thread = thread_num
 
     def close(self) -> None:
+        self._selected_thread = None
+        self._selected_frame = None
         if self._proc is not None:
             self._proc.close(grace_s=self.shutdown_grace_s)
             self._proc = None

@@ -569,8 +569,14 @@ def frame_locals(session_id: str, level: int, request: Request, thread: int | No
     frames = summary.get("detail", {})
     number = thread if thread is not None else next((int(key) for key in frames), None)
     detail = frames.get(str(number), {})
-    if level < 0 or level >= len(detail.get("frames", [])):
-        raise HTTPException(status_code=404, detail=f"thread {number} has no frame {level}")
+    # Validated against the stack's *total*, not against the frames the first screen pre-fetched. Those are a
+    # paging cap (500 of them), and treating a cap as a fact refused frames that exist: measured on a core with
+    # a 30 000-frame stack, `/frames/20000` answered "thread 1 has no frame 20000" while `/stack?offset=20000`
+    # returned exactly that frame. One frame is one click (`architecture.md` §4), and the click has to work at
+    # 20 000 as well as at 0.
+    total = int(detail.get("total") or len(detail.get("frames") or []))
+    if level < 0 or level >= total:
+        raise HTTPException(status_code=404, detail=f"thread {number} has no frame {level} (it has {total})")
     # Asked of gdb, not read out of the summary. This endpoint and the UI were both reading
     # `detail["locals"][level]`, which only ever had an answer because the backend walked every frame of every
     # thread up front — measured at 5.5 seconds of a 5.6-second load. The hop the docstring describes was

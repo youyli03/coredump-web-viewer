@@ -278,7 +278,7 @@ def test_an_unknown_architecture_says_which_architecture_it_does_not_know() -> N
         {"level": 0, "func": "f", "pc": "0x1000", "arch": "riscv:rv64"},
         {"level": 1, "func": "main", "pc": "0x2000", "arch": "riscv:rv64"},
     ]
-    transport._frame_locations = lambda thread, upto: {  # type: ignore[method-assign]
+    transport._frame_locations = lambda thread, first, upto: {  # type: ignore[method-assign]
         0: {"sp": 0x8000, "fp": 0x8000},
         1: {"sp": 0x8100, "fp": 0x8100},
     }
@@ -296,7 +296,7 @@ def test_an_extent_that_does_not_grow_is_not_a_range_and_says_so() -> None:
         {"level": 0, "func": "leaf", "pc": "0x1000", "arch": "aarch64"},
         {"level": 1, "func": "main", "pc": "0x2000", "arch": "aarch64"},
     ]
-    transport._frame_locations = lambda thread, upto: {  # type: ignore[method-assign]
+    transport._frame_locations = lambda thread, first, upto: {  # type: ignore[method-assign]
         0: {"sp": 0x9000, "fp": 0x9000},
         1: {"sp": 0x9000, "fp": 0x9000},
     }

@@ -242,6 +242,9 @@ class Stack(Permissive):
     offset: int = 0
     limit: int | None = None
     truncated: bool = False
+    """Whether this window is *not* the whole stack — frames missing above it, below it, or both. `offset` and
+    the frame count say which side; a window at the end of a deep stack is still truncated by the 30 000 frames
+    above it, and answering "not truncated" there reads as "this is all of it"."""
 
 
 class Registers(Permissive):
