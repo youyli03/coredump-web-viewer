@@ -3639,6 +3639,9 @@ function rawSection(target) {
       "div",
       { class: "readrow" },
       h("span", { class: "rname", text: label }),
+      // The `=` every other row in this rail has. Without it `u64` and its value read as one token — `u640x…`
+      // — which is exactly how the panel came to look like a list of mangled names rather than a key.
+      h("span", { class: "eq", text: "=" }),
       clickable
         ? h("button", { class: "fval jump", text, onclick: () => goTo(text) })
         : h("span", { class: "fval", text }),
@@ -3648,7 +3651,15 @@ function rawSection(target) {
   const ascii = eight.map((byte) =>
     byte === undefined ? " " : byte >= 32 && byte < 127 ? String.fromCharCode(byte) : "·",
   );
-  rows.push(h("div", { class: "readrow" }, h("span", { class: "rname", text: "as chars" }), h("span", { class: "fval", text: JSON.stringify(ascii.join("")) })));
+  rows.push(
+    h(
+      "div",
+      { class: "readrow" },
+      h("span", { class: "rname", text: "as chars" }),
+      h("span", { class: "eq", text: "=" }),
+      h("span", { class: "fval", text: JSON.stringify(ascii.join("")) }),
+    ),
+  );
 
   return h(
     "div",

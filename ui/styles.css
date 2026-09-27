@@ -443,6 +443,12 @@ button.scell.field.leads:hover { outline: 1px solid rgba(var(--tint), .9); }
 .section h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
 .aliases { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; font-size: 11.5px; }
 .chip.cycle { color: var(--stack); border-color: var(--stack); }
+/* The "read as" rows: a key, an `=`, a value — the same shape as every other row in this rail. The two class
+   names existed in the markup and were never styled, so the label and its value were adjacent inline spans:
+   `u64` + `0x…` printed as `u640x…`, and the missing `=` was part of the same problem rather than a separate
+   one. A grid rather than inline flow, so the values line up under each other. */
+.readrow { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 0 6px; align-items: baseline; padding: 1px 0; }
+.rname, .readrow .eq { color: var(--dim); font-family: var(--mono); font-size: 11.5px; }
 .fval { font-family: var(--mono); font-size: 12px; }
 .fval.muted { color: var(--anon); font-style: italic; }
 .fval.string { color: var(--read); }
