@@ -116,16 +116,44 @@ frontend and the tests branch on, and 409-from-a-session and 409-from-a-transpor
 the UI. The same is true of 422: an unparseable query string is a client mistake, while `unreadable` is the
 dump itself refusing, and only one of those should ever put an error in front of a user.
 
-### 3.2 The memory refusal, measured
+### 3.2 The memory window: what is there, what is not, and what was never asked about
 
-`GET …/memory` has two honest answers and they must not be confused:
+`GET …/memory` answers three states, and they must not be confused — `requirements.md` C3 asks for the bytes
+*and* what they mean, and a window that gets either half wrong is a window that lies about a dump:
 
-* **part of the window could not be read** → `200`, with the bytes in `chunks` and the gaps in `unread`;
-* **none of it could be read** → `422 unreadable`, with a `detail` that names the address and says which of
-  the two it is. Measured on the practice core's deliberate stray pointer: *"0xdead0000dead0000 for 16 bytes
-  is not in this dump: gdb refused the command: Unable to read memory."*
+* **bytes** → `chunks`;
+* **the dump has no bytes here** → `unread`, `200` with the gaps listed (or `422 unreadable` with gdb's own
+  sentence when *nothing* in the window could be read — measured on the practice core's deliberate stray
+  pointer: *"0xdead0000dead0000 for 16 bytes is not in this dump: gdb refused the command: Unable to read
+  memory."*);
+* **this viewer stopped asking** → `not_read`, which only appears when the round ceiling below is reached. It is
+  a different thing from `unread` on purpose: a caller can act on it, and calling those bytes missing would be
+  the same lie in the other direction.
 
-`requirements.md` §4 calls that second case "a normal result, not an error", and it is — the *summary* carries
+The three are a **partition** of the window — measured on the practice core's partly resident `crash_target`
+text page (4 096 bytes asked for): **2 389 bytes held, 1 137 missing, 570 unasked** = 4 096. That invariant is
+asserted over HTTP, because the first version of the walk broke it in the most convincing way: it accounted for
+7 666 bytes in a 4 096-byte window, `unread` having been computed twice — once from the chunk gaps and once from
+the walk's own refusals.
+
+Getting `unread` right needed two measurements of gdb that are worth writing down, both on that same page:
+
+* **a run ends at the first byte gdb cannot reach.** Asked for 8 192 bytes, gdb stops at `0x…6115d5`, and the
+  reply used to call the remaining 2 603 bytes missing — while they were right there: asked again from that
+  address, gdb skips three bytes and hands over 253 more. So the window is **walked**: after each run, ask again
+  from where it stopped, and what a long request hides comes back (measured: 379 bytes behind a skip gdb itself
+  reported as 383 bytes wide);
+* **whether gdb answers at all depends on how much was asked for.** From `0x…6115d5`, 896 bytes answer and 1 024
+  refuse, with the same data at the same addresses in between. So a refusal is only believed about **the bytes it
+  covered, at the size it was asked**: the walk subdivides (`_READ_MIN` = 64 bytes) and asks a skipped range back
+  through the same process before any byte is called missing.
+
+The cost is bounded by `_READ_ROUNDS` (64 commands per window) rather than by the dump's fragmentation: a
+contiguous window — a heap node, a live stack — costs **1** command, the partly resident page above costs the
+full 64 and reports the tail as `not_read`. Measured through the API: heap `1`, fully resident text page `1`,
+partly resident text page `64`, a wholly unreadable address `422` in `1`.
+
+`requirements.md` §4 calls the unreadable case "a normal result, not an error", and it is — the *summary* carries
 it as data (`memory.missing`), and `ui/app.js` turns the refusal into an `unread` hole rather than a failure.
 The 422 keeps "the request could not be honoured" visible to anything that is not that one caller. If it is
 ever changed to 200, the body should keep `unread` and the same reason text, so the frontend branch that

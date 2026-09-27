@@ -262,12 +262,142 @@ def _address(value: Any) -> str | None:
     return match.group(0) if match else None
 
 
+_READ_MIN = 64
+"""The smallest range a refusal is believed for.
+
+Believability improves as the request shrinks, and that is measured rather than assumed: at one address in the
+practice core's partly-resident text mapping, 8 192 bytes, 1 024 and 896 all answer or refuse in ways that
+contradict each other, while 128 answers and 3 refuses — the true hole there is three bytes wide. So the
+subdivision stops at 64 bytes: "the dump has no bytes in these 64" is a claim gdb was asked about directly, at
+a size it does not play games with, and the granularity of that claim is stated here instead of being implied.
+"""
+
+_READ_ROUNDS = 64
+"""The most `-data-read-memory-bytes` commands one window may cost.
+
+A contiguous window — a heap node, a live stack — needs **one**. The partly-resident text mapping above needs a
+few. The ceiling is what keeps a pathologically fragmented window from turning one scroll into a thousand
+commands, and whatever it cuts off is reported as `not_read` (a caller can ask again) rather than as `unread`
+(the dump has nothing there).
+"""
+
+
+def _merged(ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Adjacent ranges joined, keeping the order: two refusals side by side are one hole, not two."""
+    out: list[dict[str, Any]] = []
+    for item in sorted(ranges, key=lambda entry: int(entry["address"], 16)):
+        previous = out[-1] if out else None
+        if previous is not None:
+            previous_end = int(previous["address"], 16) + int(previous["length"])
+            if previous_end >= int(item["address"], 16):
+                end = max(previous_end, int(item["address"], 16) + int(item["length"]))
+                previous["length"] = end - int(previous["address"], 16)
+                continue
+        out.append(dict(item))
+    return out
+
+
+def _chunk_end(entry: Any) -> int | None:
+    """Where one `memory=[…]` entry ends, or `None` if the entry is not one this can measure."""
+    if not isinstance(entry, dict):
+        return None
+    contents = str(entry.get("contents") or "").strip()
+    begin = _hex_int(entry.get("begin"))
+    if not contents or begin is None or len(contents) % 2:
+        return None
+    return begin + len(contents) // 2
+
+
+def _unread_within(addr: str, length: int, chunks: list[dict[str, Any]], not_read: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The window's bytes that were asked for and refused: everything no chunk covers and no round skipped.
+
+    The three states are computed once, here, and they partition the window: `chunks` are the bytes gdb handed
+    over, `not_read` are the ranges the round ceiling left unasked, and this is the rest — each byte in exactly
+    one of them, which is what lets a caller add them up and get the window back.
+    """
+    start = _hex_int(addr)
+    if start is None:
+        raise MiParseError(f"not an address: {addr!r}")
+    end = start + length
+    unasked = [(_hex_int(item["address"]), _hex_int(item["address"]) + int(item["length"])) for item in not_read]
+    unasked = [(low, high) for low, high in unasked if low is not None and high is not None]
+
+    pieces: list[tuple[int, int]] = []
+    cursor = start
+    for chunk in chunks:  # already disjoint and in address order
+        begin = _hex_int(chunk["address"])
+        if begin is None:
+            continue
+        if begin > cursor:
+            pieces.append((cursor, min(begin, end)))
+        cursor = max(cursor, begin + int(chunk["length"]))
+    if cursor < end:
+        pieces.append((cursor, end))
+
+    out: list[dict[str, Any]] = []
+    for low, high in pieces:
+        remaining = [(low, high)]
+        for skip_low, skip_high in unasked:
+            remaining = [piece for part in remaining for piece in _cut(part, skip_low, skip_high)]
+        out.extend({"address": hex(low_), "length": high_ - low_} for low_, high_ in remaining if high_ > low_)
+    return _merged(out)
+
+
+def _cut(piece: tuple[int, int], low: int, high: int) -> list[tuple[int, int]]:
+    """`piece` with `[low, high)` taken out of it — the whole piece when they do not overlap."""
+    piece_low, piece_high = piece
+    if high <= piece_low or low >= piece_high:
+        return [piece]
+    return [part for part in ((piece_low, min(piece_high, low)), (max(piece_low, high), piece_high)) if part[1] > part[0]]
+
+
+def _within(entry: Any, start: int, end: int) -> bool:
+    """Whether one `memory=[…]` entry says anything about `[start, end)`."""
+    return isinstance(entry, dict) and (
+        _chunk_end(entry) is not None
+        and _hex_int(entry.get("begin")) is not None
+        and _hex_int(entry.get("begin")) < end
+        and _chunk_end(entry) > start
+    )
+
+
+def _disjoint(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The same bytes once, in address order, with the first reading of an overlap winning.
+
+    A window is assembled from several `-data-read-memory-bytes` answers (see `read_memory`), and a gdb that
+    skips forward inside a range can report bytes that another answer already covered. Two chunks over one
+    address is not a cosmetic problem: `analysis/reading.py` decodes words per chunk, the frontend draws them,
+    and an overlap would show one byte twice with two different neighbours.
+    """
+    out: list[dict[str, Any]] = []
+    covered = 0
+    for chunk in sorted(chunks, key=lambda item: int(item["address"], 16)):
+        begin = int(chunk["address"], 16)
+        stop = begin + chunk["length"]
+        if out:
+            previous_begin = int(out[-1]["address"], 16)
+            covered = max(covered, previous_begin + out[-1]["length"])
+        if begin < covered:
+            if stop <= covered:
+                continue
+            cut = covered - begin
+            chunk = {"address": hex(covered), "length": stop - covered, "bytes": chunk["bytes"][cut * 2 :]}
+            begin = covered
+        out.append(chunk)
+        covered = max(covered, stop)
+    return out
+
+
 def _memory_reply(entries: Iterable[Any], addr: str, length: int) -> dict[str, Any]:
     """Turn `-data-read-memory-bytes` entries into chunks plus the holes between them.
 
     gdb answers a range it can only partly read by *truncating* the last chunk (measured: 8192 bytes
     asked for, `end` on the region boundary), so the request's own end is the only thing that says how
     much is missing. Nothing may be padded: a hole has to stay visible as a hole.
+
+    Which is why the caller walks the window (`read_memory`): the entries handed in here are the runs of the
+    *whole* request, gathered over as many commands as it took, and every gap between two of them is a hole
+    gdb skipped.
     """
     start = _hex_int(addr)
     if start is None:
@@ -286,7 +416,7 @@ def _memory_reply(entries: Iterable[Any], addr: str, length: int) -> dict[str, A
         if len(contents) % 2 or not _HEX_BYTES.match(contents):
             raise MiParseError(f"contents is not an even run of hex digits: {contents[:64]!r}")
         chunks.append({"address": hex(begin), "length": len(contents) // 2, "bytes": contents.lower()})
-    chunks.sort(key=lambda chunk: int(chunk["address"], 16))
+    chunks = _disjoint(chunks)
 
     unread: list[dict[str, str]] = []
     cursor = start
@@ -1288,28 +1418,138 @@ class MiTransport(Transport):
         )
 
     def read_memory(self, addr: str, length: int) -> dict[str, Any]:
-        """`-data-read-memory-bytes`, holes preserved.
+        """`-data-read-memory-bytes`, holes preserved — and **the whole window asked for**, not just its first run.
 
-        A refusal is checked before it is called a hole: if this gdb simply does not implement the
-        command, that is `Unsupported` (a capability the UI greys out), not "the dump is missing it".
+        One command is not enough, and this is measured rather than assumed. Two facts about gdb, both on the
+        practice core's `crash_target` text mapping (8 192 bytes at `0x…610000`, from the executable's file
+        offset 12 288), which is only partly resident:
+
+        * **a run ends at the first byte gdb cannot reach.** Asked for 8 192 bytes, gdb stops at `0x…6115d5` and
+          says nothing about the rest — so the reader used to call 2 603 bytes "not in this dump" while they
+          were sitting right there: asked again from `0x…6115d5`, gdb skips three missing bytes and hands over
+          253 more. Reporting present bytes as absent is the same class of lie as reporting absent bytes as
+          zero, which is what this walk exists to stop;
+        * **whether gdb answers at all depends on how much was asked for.** From `0x…6115d5`, 896 bytes answer
+          and 1 024 refuse — with the same data at the same addresses in between. So a refusal is only evidence
+          about the bytes it covered *at the size it was asked*, and the walk narrows to `_READ_PROBE` bytes
+          before it believes one.
+
+        Every range this reports as `unread` was therefore asked for **exactly**, at a size gdb answers, and
+        refused: that is what makes "the dump has no bytes here" a measurement rather than an inference. A skip
+        gdb reports inside an answer is checked the same way before it is called a hole. When the round ceiling
+        is reached the remainder goes in `not_read` — "not asked about", which a caller can act on — never in
+        `unread`.
         """
         target = _address(addr)
         if target is None:
             raise GdbError(f"not an address: {addr!r}")
+        start = int(target, 16)
+        entries: list[Any] = []
+        holes: list[dict[str, Any]] = []
+        not_read: list[dict[str, Any]] = []
+        refusals: list[str] = []
+        not_read: list[dict[str, Any]] = []
+        self._cover(start, start + length, entries, not_read, _READ_ROUNDS, refusals)
+
+        if not entries and not not_read:
+            # Nothing came back and nothing was left unasked: every byte of the window was asked for and refused.
+            # This is the "none of it could be read" case, which the API reports as `422 unreadable` rather than as
+            # a window full of holes — and it carries **gdb's own words**, because a refusal that loses its
+            # sentence is a refusal nobody can act on.
+            why = refusals[0] if refusals else "gdb refused the command"
+            raise Unreadable(f"{target} for {length} bytes is not in this dump: {why}")
+
+        reply = _memory_reply(entries, target, length)
+        reply["unread"] = _unread_within(target, length, reply["chunks"], not_read)
+        if not_read:
+            reply["not_read"] = _merged(not_read)
+        return reply
+
+    def _cover(
+        self,
+        start: int,
+        end: int,
+        entries: list[Any],
+        not_read: list[dict[str, Any]],
+        budget: int,
+        refusals: list[str],
+    ) -> int:
+        """Ask for `[start, end)` and keep subdividing until every byte has either been answered or been asked.
+
+        Two measurements shape this, both in `read_memory`'s docstring: a run stops at the first byte gdb cannot
+        reach, and whether gdb answers *at all* depends on how much was asked for. So neither "it stopped here"
+        nor "it refused" is believed about a byte until the range has been cut down to `_READ_MIN` — and an
+        answer that begins late sends the range it skipped back through the same process, which is how bytes a
+        long request hides (measured: 379 of them behind a skip gdb reported as 383) come back.
+
+        Two things are recorded: the entries that answered, and the ranges that were **never asked about**
+        because the budget ran out. What is left — the bytes that were asked for and refused — is the difference,
+        worked out from the window in `_unread_within`, so a byte cannot be in two states at once.
+        """
+        while start < end:
+            if budget <= 0:
+                not_read.append({"address": hex(start), "length": end - start})
+                return 0
+            budget -= 1
+            answered, refusal = self._read_once(start, end - start)
+            asked_end = end
+            if answered is None:
+                if refusal:
+                    refusals.append(refusal)
+                if end - start <= _READ_MIN:
+                    return budget  # asked for exactly these bytes, refused: they are not in the dump
+                middle = start + (end - start) // 2
+                budget = self._cover(start, middle, entries, not_read, budget, refusals)
+                start = middle
+                continue
+
+            # Clamped to the range that was asked about: gdb's answer is evidence about the bytes it was asked
+            # for, and nothing beyond them.
+            runs = [
+                (max(begin, start), min(stop, asked_end))
+                for begin, stop in ((_hex_int(entry.get("begin")), _chunk_end(entry)) for entry in answered)
+                if begin is not None and stop is not None and min(stop, asked_end) > max(begin, start)
+            ]
+            if not runs:
+                # An answer with nothing in it, at a size that answers: cut it in half if there is room,
+                # otherwise say it was not asked about rather than let it look like absent bytes.
+                if end - start > _READ_MIN:
+                    middle = start + (end - start) // 2
+                    budget = self._cover(start, middle, entries, not_read, budget, refusals)
+                    start = middle
+                    continue
+                not_read.append({"address": hex(start), "length": end - start})
+                return budget
+
+            first = min(begin for begin, _stop in runs)
+            last = max(stop for _begin, stop in runs)
+            if first > start:
+                # gdb skipped these bytes. It may be right or it may be hiding data, so they go back through the
+                # same subdivision rather than being called missing on gdb's say-so.
+                budget = self._cover(start, first, entries, not_read, budget, refusals)
+            entries.extend(entry for entry in answered if _within(entry, start, asked_end))
+            if last >= end:
+                return budget
+            start = min(last, end)
+        return budget
+
+    def _read_once(self, start: int, length: int) -> tuple[list[Any] | None, str]:
+        """One `-data-read-memory-bytes`: `(entries, "")`, or `(None, gdb's own words)` when it refuses.
+
+        A refusal here is a statement about the *dump*, so a transport failure never comes back this way: a dead
+        or unresponsive gdb raises. Measured the hard way — a killed child made every read of a perfectly mapped
+        address answer "not in this dump", with the transport's own failure text appended, and nothing above had
+        a chance to notice.
+        """
         try:
-            results = self._result(self._exec(f"-data-read-memory-bytes {target} {length}"))
+            results = self._result(self._exec(f"-data-read-memory-bytes {hex(start)} {length}"))
         except (GdbDied, GdbTimeout):
-            # Not a statement about the dump. `Unreadable` means "this address is not in the core", and saying
-            # that when the *debugger* failed is the kind of quiet lie this transport must not tell — the same
-            # reason a stripped binary is stated rather than shown as an empty answer. Measured the hard way: a
-            # killed gdb child made every read of a perfectly mapped address answer "not in this dump", with the
-            # transport's own failure text appended to it, and nothing above had a chance to notice.
             raise
         except GdbError as exc:
             if _NO_SUCH_COMMAND.search(str(exc)):
                 raise Unsupported(f"this gdb has no -data-read-memory-bytes: {exc}") from exc
-            raise Unreadable(f"{target} for {length} bytes is not in this dump: {exc}") from exc
-        return _memory_reply(results.get("memory") or [], target, length)
+            return None, str(exc)
+        return list(results.get("memory") or []), ""
 
     def disassemble(
         self,

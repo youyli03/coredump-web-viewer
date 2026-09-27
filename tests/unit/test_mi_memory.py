@@ -147,6 +147,129 @@ def test_a_refusal_is_reported_in_gdbs_own_words() -> None:
     assert _refusal({"results": {}}) == "{}"
 
 
+# --- the walk: a window is asked for until every byte is answered or refused ----------- #
+class WindowGdb:
+    """A gdb with a hole in a window, and the two quirks the real one has (both measured).
+
+    `holes` are the ranges this fake cannot read. `refuse_over` is the length above which it refuses *any*
+    request that starts inside or before a hole, which is what the real gdb does on the practice core's
+    partly-resident text mapping: 896 bytes answer, 1 024 refuse, at the same address.
+    """
+
+    def __init__(self, base: int, length: int, *, holes: list[tuple[int, int]], refuse_over: int | None = None):
+        self.base = base
+        self.length = length
+        self.holes = holes
+        self.refuse_over = refuse_over
+        self.commands: list[tuple[int, int]] = []
+
+    def exec(self, command: str, *, timeout: float | None = None) -> list[dict]:
+        from analysis.gdb.mi import parse_records
+
+        if not command.startswith("-data-read-memory-bytes"):
+            return parse_records(["^done"])
+        _, address, length = command.split(" ")
+        start, want = int(address, 16), int(length)
+        self.commands.append((start, want))
+        end = start + want
+        # Find the first readable byte at or after `start`, the way gdb scans forward.
+        if self.refuse_over is not None and want > self.refuse_over:
+            return parse_records(['^error,msg="Unable to read memory."'])
+        run = start
+        while run < end and any(low <= run < high for low, high in self.holes):
+            run += 1
+        if run >= end:
+            return parse_records(['^error,msg="Unable to read memory."'])
+        stop = run
+        while stop < end and not any(low <= stop < high for low, high in self.holes):
+            stop += 1
+        contents = "ab" * (stop - run)
+        return parse_records(
+            [f'^done,memory=[{{begin="{hex(run)}",offset="{hex(run - start)}",end="{hex(stop)}",'
+             f'contents="{contents}"}}]']
+        )
+
+
+def _walking_transport(fake: WindowGdb) -> MiTransport:
+    transport = _bare_transport()
+    transport._exec = fake.exec  # type: ignore[method-assign]
+    return transport
+
+
+def test_a_window_is_asked_for_again_after_a_hole() -> None:
+    """**The regression this pins.** gdb stops at the first byte it cannot reach; everything after it used to
+    be reported as "not in this dump" while being readable.
+
+    Measured on the practice core, and the reason the transport walks: asked for 8 192 bytes of the `crash_target`
+    text mapping, gdb stopped at `0x…6115d5`, and the reply called the remaining 2 603 bytes missing — asked
+    again from that address, gdb skipped three bytes and handed over 253 more.
+    """
+    base = 0x1000
+    fake = WindowGdb(base, 0x100, holes=[(base + 8, base + 16)])
+    window = _walking_transport(fake).read_memory(hex(base), 0x100)
+
+    assert [chunk["address"] for chunk in window["chunks"]] == [hex(base), hex(base + 16)]
+    assert window["unread"] == [{"address": hex(base + 8), "length": 8}]
+    assert sum(chunk["length"] for chunk in window["chunks"]) == 0x100 - 8
+    assert len(fake.commands) > 1, "one command cannot see past a hole"
+
+
+def test_a_long_refusal_is_not_believed_about_a_shorter_range() -> None:
+    """The second quirk, and the reason the walk subdivides instead of stopping: measured, gdb refuses a
+    1 024-byte request and answers a 896-byte one at the very same address.
+
+    The first request is still the whole window — that is the fast path a contiguous window needs, and it is one
+    command. What must not happen is the refusal being read as "these bytes are not in the dump".
+    """
+    base = 0x2000
+    fake = WindowGdb(base, 0x400, holes=[], refuse_over=0x200)
+    window = _walking_transport(fake).read_memory(hex(base), 0x400)
+
+    assert window["unread"] == [], "refusing the whole window is not a statement that its bytes are missing"
+    assert sum(chunk["length"] for chunk in window["chunks"]) == 0x400
+    assert fake.commands[0] == (base, 0x400), "the whole window is worth one command: it usually answers"
+    assert any(0 < want <= 0x200 for _start, want in fake.commands), (
+        f"after the refusal it has to ask for less, or it never learns anything: {fake.commands}"
+    )
+
+
+def test_a_range_that_is_really_missing_is_reported_missing() -> None:
+    """A hole survives the walk as a hole — and only after gdb was asked about exactly those bytes."""
+    base = 0x3000
+    fake = WindowGdb(base, 0x100, holes=[(base + 0x40, base + 0x100)])
+    window = _walking_transport(fake).read_memory(hex(base), 0x100)
+
+    assert window["unread"] == [{"address": hex(base + 0x40), "length": 0xC0}]
+    assert sum(chunk["length"] for chunk in window["chunks"]) == 0x40
+    # The last question asked was about the missing range itself, not about something that contains it.
+    assert (base + 0x40, 0xC0) in fake.commands or any(
+        start >= base + 0x40 for start, _want in fake.commands
+    )
+
+
+def test_the_walk_stops_at_its_ceiling_and_says_not_read() -> None:
+    """A window may not cost an unbounded number of commands, and what the ceiling cuts off is `not_read`:
+    "this viewer stopped asking", which a caller can act on — never `unread`, which means the dump is empty."""
+    from analysis.gdb.mi import _READ_ROUNDS
+
+    base = 0x4000
+    size = 4096
+    # One missing byte every sixteen: 256 readable runs in the window, far more than the ceiling can establish.
+    holes = [(base + offset + 15, base + offset + 16) for offset in range(0, size, 16)]
+    fake = WindowGdb(base, size, holes=holes)
+    window = _walking_transport(fake).read_memory(hex(base), size)
+
+    assert "not_read" in window, "the ceiling has to show up in the answer, or it is a silent truncation"
+    assert all(item["length"] > 0 for item in window["not_read"]), "and it names real ranges, not empty ones"
+    accounted = (
+        sum(chunk["length"] for chunk in window["chunks"])
+        + sum(item["length"] for item in window["unread"])
+        + sum(item["length"] for item in window["not_read"])
+    )
+    assert accounted == size, "every byte of the window is accounted for exactly once, in one of three states"
+    assert len(fake.commands) <= _READ_ROUNDS, f"the ceiling is a ceiling: {len(fake.commands)} commands"
+
+
 @pytest.mark.parametrize(
     ("dressed", "expected"),
     [
