@@ -355,6 +355,7 @@ class Session:
             summary = self.summary or {}
             memory_map = summary.get("memory_map") or {}
             regions = memory_map.get("regions") or []
+            libraries = memory_map.get("libraries") or []
             region = next(
                 (item for item in regions if int(item["start"], 16) <= address < int(item["end"], 16)),
                 None,
@@ -373,7 +374,20 @@ class Session:
                 size_sz=int(memory_map.get("word_size") or 8),
             )
             if self._arena is None:
-                self._arena = heap.arena_facts(self.transport)
+                facts = heap.arena_facts(self.transport)
+                # An arena is only a confirmation when the libc gdb read is the build the dump ran: see
+                # `heap.arena_check` — gdb will use a mismatched file with a warning, and an arena from the wrong
+                # libc is a plausible number from the wrong file.
+                facts["check"] = heap.arena_check(libraries, regions)
+                if facts["symbol"] and facts["check"]["agrees"] is not True:
+                    facts["trusted"] = False
+                    facts["why"] = (
+                        "gdb answered for `main_arena`, but not from this dump's own libc: "
+                        + str(facts["check"]["why"])
+                    )
+                else:
+                    facts["trusted"] = bool(facts["symbol"])
+                self._arena = facts
             answer["address"] = key
             answer["arena"] = self._arena
             self._heaps[key] = answer
@@ -492,6 +506,7 @@ class SessionManager:
             summary = self.summary or {}
             memory_map = summary.get("memory_map") or {}
             regions = memory_map.get("regions") or []
+            libraries = memory_map.get("libraries") or []
             region = next(
                 (item for item in regions if int(item["start"], 16) <= address < int(item["end"], 16)),
                 None,
@@ -510,7 +525,20 @@ class SessionManager:
                 size_sz=int(memory_map.get("word_size") or 8),
             )
             if self._arena is None:
-                self._arena = heap.arena_facts(self.transport)
+                facts = heap.arena_facts(self.transport)
+                # An arena is only a confirmation when the libc gdb read is the build the dump ran: see
+                # `heap.arena_check` — gdb will use a mismatched file with a warning, and an arena from the wrong
+                # libc is a plausible number from the wrong file.
+                facts["check"] = heap.arena_check(libraries, regions)
+                if facts["symbol"] and facts["check"]["agrees"] is not True:
+                    facts["trusted"] = False
+                    facts["why"] = (
+                        "gdb answered for `main_arena`, but not from this dump's own libc: "
+                        + str(facts["check"]["why"])
+                    )
+                else:
+                    facts["trusted"] = bool(facts["symbol"])
+                self._arena = facts
             answer["address"] = key
             answer["arena"] = self._arena
             self._heaps[key] = answer

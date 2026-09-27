@@ -219,6 +219,45 @@ def test_a_long_scan_stops_at_its_limit_and_says_so(tmp_path: pathlib.Path) -> N
     assert answer["heap"] is not None, "0x800 bytes of consistent headers is already a heap"
 
 
+# --- is the arena a confirmation at all? ---------------------------------------------------- #
+def test_an_arena_from_a_different_build_is_not_a_confirmation(tmp_path: pathlib.Path, elf_image) -> None:
+    """gdb will use a library it calls the wrong version — so an arena from it must not be called agreement.
+
+    Measured: handed a core whose libc is build X and a file that is build Y, gdb has loaded the file anyway
+    (`wrong library or version mismatch?` is a warning, not a stop) and read values out of it. Those values are
+    plausible numbers from the wrong library, which is exactly the answer this project refuses to give.
+    """
+    dump_libc = elf_image("27027b96e5b8c475fc327aa445bea1c71d37b4e2")  # what the core ran
+    other = tmp_path / "libc.so.6"
+    other.write_bytes(elf_image("1ca237614d3f804b9f671da20aa60b621c519a20"))  # glibc 2.28 from a toolchain
+
+    regions = [
+        {"start": "0xf5000000", "end": "0xf5100000", "image": {"build_id": "27027b96e5b8c475fc327aa445bea1c71d37b4e2"}},
+    ]
+    libraries = [
+        {"name": "/lib/aarch64-linux-gnu/libc.so.6", "host_name": str(other),
+         "ranges": [{"start": "0xf5001000", "end": "0xf5002000"}]},
+    ]
+    check = heap.arena_check(libraries, regions)
+    assert check["agrees"] is False
+    assert "wrong file" in check["why"] and "1ca23761" in check["why"] and "27027b96" in check["why"]
+
+    # The same file the dump ran: agreement, and the reason names the id both sides hold.
+    matching_file = tmp_path / "libc-real.so.6"
+    matching_file.write_bytes(dump_libc)
+    agreeing = heap.arena_check([{**libraries[0], "host_name": str(matching_file)}], regions)
+    assert agreeing["agrees"] is True and "27027b96" in agreeing["why"]
+
+
+def test_an_arena_with_nothing_to_check_against_says_so() -> None:
+    """No host file, no range, no build-id in the mapping: three ways of not knowing, each named."""
+    no_host = heap.arena_check([{"name": "/lib/libc.so.6", "host_name": None, "ranges": [{"start": "0x1000", "end": "0x2000"}]}], [])
+    assert no_host["agrees"] is None and "found no file" in no_host["why"]
+    no_range = heap.arena_check([{"name": "/lib/libc.so.6", "host_name": "/x", "ranges": []}], [])
+    assert no_range["agrees"] is None and "placed no range" in no_range["why"]
+    assert heap.arena_check([], [])["agrees"] is None
+
+
 def test_the_reported_chunks_are_a_window_around_the_address_and_always_include_the_top(
     tmp_path: pathlib.Path,
 ) -> None:

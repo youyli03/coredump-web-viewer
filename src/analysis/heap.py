@@ -392,6 +392,62 @@ def _looks_like_heap_info(blob: bytes, prefix: int, *, base: int, size_sz: int) 
     return _plausible_header(blob, prefix, size_sz=size_sz) is not None
 
 
+def arena_check(libraries: list[dict[str, Any]], regions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Is the libc gdb read the *build this dump ran*? Confirmation is only worth having if it is.
+
+    Measured twice over: gdb rejects a file whose build-id is not the dump's (`libc.so.6` from another toolchain
+    was refused outright with `Can't open file …`), **and** it will use one it can (`wrong library or version
+    mismatch?` is a warning, not a stop — an `ld-linux` from the gdb's own toolchain was loaded that way and even
+    given a range). If the second happens for libc, then `main_arena.top` is read at an address computed from a
+    different library's layout: a plausible number from the wrong file, which is the one kind of answer this
+    project refuses to give. So the arena is compared against the mapping gdb placed libc in, and the only case
+    that counts as confirmation is the builds being equal by **id**.
+    """
+    libc = next(
+        (entry for entry in libraries if str(entry.get("name") or "").endswith("libc.so.6")),
+        None,
+    )
+    if libc is None:
+        return {"agrees": None, "why": "this dump's library list names no libc.so.6, so there is nothing to check"}
+    host = libc.get("host_name")
+    if not host:
+        return {
+            "agrees": None,
+            "why": "gdb found no file for this dump's libc, so an arena it reports could come from anywhere",
+        }
+    ranges = libc.get("ranges") or []
+    if not ranges:
+        return {"agrees": None, "why": "gdb placed no range for this dump's libc, so the mapping cannot be checked"}
+    low = int(ranges[0]["start"], 16)
+    region = next(
+        (item for item in regions if int(item["start"], 16) <= low < int(item["end"], 16)),
+        None,
+    )
+    dumped_id = ((region or {}).get("image") or {}).get("build_id")
+    if not dumped_id:
+        return {
+            "agrees": None,
+            "why": "the mapping gdb placed libc in carries no build-id, so there is nothing to compare against",
+        }
+    from analysis import elfimage
+
+    file_id = elfimage.build_id_of_file(pathlib.Path(str(host)))
+    if not file_id:
+        return {"agrees": None, "why": f"{host} has no build-id of its own to compare"}
+    if file_id == dumped_id:
+        return {
+            "agrees": True,
+            "why": f"the libc gdb read is build {file_id}, which is the id the dump's own libc mapping carries",
+        }
+    return {
+        "agrees": False,
+        "why": (
+            f"gdb read {host} (build {file_id}) for a dump whose libc is build {dumped_id}: an arena from a "
+            "different libc is a plausible number from the wrong file, so it is not reported as confirmation"
+        ),
+    }
+
+
 def arena_facts(transport: Any) -> dict[str, Any]:
     """glibc's own arena, when this dump's libc has symbols for it — otherwise why gdb cannot say.
 

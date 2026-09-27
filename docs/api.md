@@ -408,6 +408,15 @@ expressions answer and the wilderness the walk found can be checked against `mai
 with an inference. With this bundle's stripped libc they are refused, and the reply carries gdb's own words. What
 it never does is silently give up: the walk needs no symbols at all, which is why it exists.
 
+**And a confirmation has to be the dump's own libc.** `arena.check` compares the build-id of the file gdb read
+for libc with the build-id of the mapping gdb placed libc in, because gdb will happily use a file it calls the
+wrong version (`wrong library or version mismatch?` is a warning, not a stop — measured: an `ld-linux` from gdb's
+own toolchain was loaded that way and even given a range). An arena read out of a different library's layout is a
+plausible number from the wrong file, so `arena.trusted` is `false` unless the ids are equal, and `why` says
+which id was which. Measured on this checkout's data, the check cannot even get that far: the bundle's libc has no
+`.symtab` at all (3072 dynamic symbols, `malloc` among them, `main_arena` — a *local* symbol — not), so gdb
+refuses the arena and the confirmation path stays unexercised here rather than untested.
+
 In the GUI the button (`heap`) appears for an anonymous writable mapping in the memory view's header, and the
 line under it reads `heap main arena (brk) · 17 chunks · in use 5.6 KB, free 0 B, top 126.4 KB · 100% of the
 mapping is that chain · at this address: chunk 0xc9bc79ad4290 (64 B, in use) · no arena symbol in this libc, so
